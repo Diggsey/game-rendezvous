@@ -1,24 +1,29 @@
 //! Joining: asking a host through the relays, then connecting directly.
+//!
+//! As for hosting, the game thread ([`Join`]) runs what needs the socket (the public address,
+//! the connectivity checks), and a task on the worker ([`relay`]) what needs the joiner's key
+//! (sealing the request, opening the host's answer).
+
+mod relay;
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr_sdk::prelude::{Event, Filter, Keys, PublicKey, SubscriptionId, Timestamp};
+use nostr_sdk::prelude::{Filter, Keys, SubscriptionId, Timestamp};
 use tracing::{debug, info};
 
 use crate::Inner;
 use crate::error::JoinError;
-use crate::handshake::{self, HANDSHAKE_KIND, Message};
+use crate::handshake::{HANDSHAKE_KIND, Message};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::{GameInfo, PROTOCOL};
 use crate::net::{self, LocalAddr};
-use crate::signal::{Command, Inbox, Published};
+use crate::signal::{self, Command, Inbox, Sink};
 use crate::stun::{self, Gatherer};
+use relay::{FromRelay, Relay, SendRequest};
 
-/// How often the join request is repeated until the host answers.
-const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 /// After nomination, how long the checks go on before the socket is handed over, so that the
 /// host's side of the nominated pair completes too.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -49,8 +54,11 @@ enum Stage {
     /// The gatherer starts once the STUN servers' names are resolved.
     Gathering(Option<Gatherer>),
     WaitingForHost {
-        first_sent: Instant,
-        last_sent: Instant,
+        /// When the request went out, then when a relay took it: the host's time to answer
+        /// runs from there.
+        since: Instant,
+        /// A relay took the request.
+        published: bool,
     },
     Connecting {
         since: Instant,
@@ -67,8 +75,6 @@ enum Stage {
 pub struct Join {
     inner: Arc<Inner>,
     socket: Option<UdpSocket>,
-    keys: Keys,
-    host: PublicKey,
     attempt: String,
     player_name: String,
     locals: Vec<LocalAddr>,
@@ -76,10 +82,10 @@ pub struct Join {
     stage: Stage,
     started: Instant,
     subscription: SubscriptionId,
-    replies: Inbox<Event>,
+    /// Dropping it ends the relay task.
+    to_relay: Sink<SendRequest>,
+    from_relay: Inbox<FromRelay>,
     link: Option<Link>,
-    request: Option<Event>,
-    first_publish: Option<Inbox<Published>>,
     symmetric_nat: bool,
 }
 
@@ -109,24 +115,39 @@ impl Join {
             .author(game.id.0)
             .since(Timestamp::now() - 10);
         let (subscription, replies) = inner.signal.subscribe(filter);
+        let attempt = format!("{:016x}", rand::random::<u64>());
+        let (to_relay, commands) = signal::channel();
+        let (notices, from_relay) = signal::channel();
+        let relay_parts = (game.id.0, attempt.clone(), inner.config.handshake_rate);
+        inner.signal.spawn(move |ctx| {
+            let (host, attempt, handshake_rate) = relay_parts;
+            Relay {
+                ctx,
+                keys,
+                host,
+                attempt,
+                handshake_rate,
+                commands,
+                replies,
+                notices,
+            }
+            .run()
+        });
         let now = Instant::now();
         info!("joining {} ({})", game.name, game.id);
         Ok(Join {
             inner,
             socket: Some(socket),
-            keys,
-            host: game.id.0,
-            attempt: format!("{:016x}", rand::random::<u64>()),
+            attempt,
             player_name: player_name.to_string(),
             locals,
             port,
             stage: Stage::Gathering(None),
             started: now,
             subscription,
-            replies,
+            to_relay,
+            from_relay,
             link: None,
-            request: None,
-            first_publish: None,
             symmetric_nat: false,
         })
     }
@@ -193,36 +214,15 @@ impl Join {
                     gathered = Some(reflexive);
                 }
             }
-            Stage::WaitingForHost {
-                first_sent,
-                last_sent,
-            } => {
-                // The host's time to answer runs from when a relay took the request.
+            Stage::WaitingForHost { since, published } => {
                 let timeout = self.inner.config.handshake_timeout;
-                if let Some(rx) = &mut self.first_publish {
-                    match rx.try_recv() {
-                        Ok(p) if p.accepted == 0 => {
-                            return Some(Err(JoinError::RelaysUnavailable(p.errors.join("; "))));
-                        }
-                        Ok(_) => {
-                            self.first_publish = None;
-                            *first_sent = now;
-                        }
-                        Err(_) if now - *first_sent > timeout * 2 => {
-                            return Some(Err(JoinError::RelaysUnavailable(
-                                "no relay answered".into(),
-                            )));
-                        }
-                        Err(_) => {}
-                    }
-                } else if now - *first_sent > timeout {
+                if *published && now - *since > timeout {
                     return Some(Err(JoinError::HostNotResponding));
                 }
-                if now - *last_sent >= REQUEST_INTERVAL
-                    && let Some(r) = &self.request
-                {
-                    *last_sent = now;
-                    self.inner.signal.publish(r.clone());
+                if !*published && now - *since > timeout * 2 {
+                    return Some(Err(JoinError::RelaysUnavailable(
+                        "no relay answered".into(),
+                    )));
                 }
             }
             Stage::Connecting { since } => {
@@ -270,26 +270,30 @@ impl Join {
             player_name: self.player_name.clone(),
             ice: link.params(),
         };
-        let event = handshake::seal(&self.keys, &self.host, &request)
-            .ok_or_else(|| JoinError::RelaysUnavailable("could not sign the request".into()))?;
-        self.first_publish = Some(self.inner.signal.publish_tracked(event.clone()));
-        self.request = Some(event);
+        // Sealed, sent and repeated by the relay task.
+        let _ = self.to_relay.send(SendRequest(request));
         self.link = Some(link);
         self.stage = Stage::WaitingForHost {
-            first_sent: now,
-            last_sent: now,
+            since: now,
+            published: false,
         };
         Ok(())
     }
 
     /// Reads the host's answers and every datagram on the socket.
     fn receive(&mut self, now: Instant) -> Result<(), JoinError> {
-        while let Ok(event) = self.replies.try_recv() {
-            if event.pubkey != self.host {
-                continue;
-            }
-            match handshake::open(&self.keys, &event) {
-                Some(Message::Accept { attempt, ice }) if attempt == self.attempt => {
+        while let Ok(notice) = self.from_relay.try_recv() {
+            match notice {
+                FromRelay::Published(p) => {
+                    if p.accepted == 0 {
+                        return Err(JoinError::RelaysUnavailable(p.errors.join("; ")));
+                    }
+                    if let Stage::WaitingForHost { since, published } = &mut self.stage {
+                        *since = now;
+                        *published = true;
+                    }
+                }
+                FromRelay::Accepted(ice) => {
                     if let (Some(link), Stage::WaitingForHost { .. }) =
                         (&mut self.link, &self.stage)
                     {
@@ -301,10 +305,7 @@ impl Join {
                         self.stage = Stage::Connecting { since: now };
                     }
                 }
-                Some(Message::Refuse { attempt, reason }) if attempt == self.attempt => {
-                    return Err(JoinError::Refused(reason));
-                }
-                _ => {}
+                FromRelay::Refused(reason) => return Err(JoinError::Refused(reason)),
             }
         }
         let Some(socket) = &self.socket else {

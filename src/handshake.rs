@@ -5,6 +5,8 @@
 //! The joiner signs with a key it makes up for the attempt, so the host learns nothing about it
 //! but its game version and player name.
 
+use std::time::{Duration, Instant};
+
 use nostr_sdk::prelude::nip44;
 use nostr_sdk::prelude::{Event, EventBuilder, FinalizeEvent, Keys, Kind, PublicKey, Tag};
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,51 @@ pub(crate) fn open(keys: &Keys, event: &Event) -> Option<Message> {
     }
     let json = nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content).ok()?;
     serde_json::from_str(&json).ok()
+}
+
+/// Caps the handshake messages decrypted per second: the cost of decrypting is the one a
+/// stranger can impose by sending events.
+pub(crate) struct DecryptBudget {
+    per_second: u32,
+    window: Instant,
+    used: u32,
+    /// Messages dropped unread in the current window, reported once it ends.
+    dropped: u32,
+}
+
+impl DecryptBudget {
+    pub fn new(per_second: u32) -> Self {
+        DecryptBudget {
+            per_second,
+            window: Instant::now(),
+            used: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Whether one more message may be decrypted now.
+    pub fn take(&mut self) -> bool {
+        let now = Instant::now();
+        if now - self.window >= Duration::from_secs(1) {
+            if self.dropped > 0 {
+                tracing::warn!(
+                    "dropped {} handshake messages unread (over {} a second)",
+                    self.dropped,
+                    self.per_second
+                );
+            }
+            self.window = now;
+            self.used = 0;
+            self.dropped = 0;
+        }
+        if self.used < self.per_second {
+            self.used += 1;
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
 }
 
 #[cfg(test)]

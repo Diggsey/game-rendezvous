@@ -3,10 +3,14 @@
 //! and runs port mappings.
 //!
 //! The game-facing types never block: they send [`Command`]s here and read answers from
-//! channels ([`Inbox`]) when they are polled.
+//! channels ([`Inbox`]) when they are polled. Work that involves the players' keys (signing,
+//! encrypting and decrypting) runs here too, in tasks a host or a join starts with
+//! [`Signal::spawn`], so that nothing a stranger sends costs the game's frame time.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -46,10 +50,6 @@ pub(crate) struct Published {
 }
 
 pub(crate) enum Command {
-    Publish {
-        event: Event,
-        done: Option<Sink<Published>>,
-    },
     Subscribe {
         id: SubscriptionId,
         filter: Filter,
@@ -61,7 +61,38 @@ pub(crate) enum Command {
         events: Sink<PortMapEvent>,
         stop: oneshot::Receiver<()>,
     },
+    /// Runs a task on the worker. Shutting down waits for it (briefly), so a task can still
+    /// publish a last event once its owner has gone.
+    Spawn(Box<dyn FnOnce(TaskContext) -> TaskFuture + Send>),
     Shutdown,
+}
+
+pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// What a task on the worker can use: the relay client, directly (the worker's command loop
+/// stops at shutdown, while its tasks get a moment to finish).
+#[derive(Clone)]
+pub(crate) struct TaskContext {
+    client: Client,
+    shared: Arc<Shared>,
+}
+
+impl TaskContext {
+    /// Publishes `event`, waiting for the relays' answers.
+    pub async fn publish(&self, event: &Event) -> Published {
+        publish(&self.client, &self.shared, event).await
+    }
+
+    /// Publishes `event` in the background; its outcome goes to `done`, if given.
+    pub fn publish_in_background(&self, event: Event, done: Option<Sink<Published>>) {
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            let outcome = ctx.publish(&event).await;
+            if let Some(done) = done {
+                let _ = done.send(outcome);
+            }
+        });
+    }
 }
 
 /// State the worker shares with the game side.
@@ -136,18 +167,13 @@ impl Signal {
         let _ = self.commands.send(c);
     }
 
-    pub fn publish(&self, event: Event) {
-        self.send(Command::Publish { event, done: None });
-    }
-
-    /// Publishes `event`; the outcome arrives on the returned channel.
-    pub fn publish_tracked(&self, event: Event) -> Inbox<Published> {
-        let (tx, rx) = channel();
-        self.send(Command::Publish {
-            event,
-            done: Some(tx),
-        });
-        rx
+    /// Runs `task` on the worker.
+    pub fn spawn<F, Fut>(&self, task: F)
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.send(Command::Spawn(Box::new(move |ctx| Box::pin(task(ctx)))));
     }
 
     /// Events matching `filter` from now on (and stored ones), until `Unsubscribe(id)`.
@@ -196,16 +222,6 @@ async fn run(
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Shutdown) => break,
-                Some(Command::Publish { event, done }) => {
-                    let client = client.clone();
-                    let shared = shared.clone();
-                    tasks.spawn(async move {
-                        let outcome = publish(&client, &shared, &event).await;
-                        if let Some(done) = done {
-                            let _ = done.send(outcome);
-                        }
-                    });
-                }
                 Some(Command::Subscribe { id, filter, events }) => {
                     sinks.insert(id.clone(), events);
                     let client = client.clone();
@@ -224,6 +240,12 @@ async fn run(
                 }
                 Some(Command::MapPort { port, events, stop }) => {
                     tasks.spawn(portmap::run(port, events, stop));
+                }
+                Some(Command::Spawn(task)) => {
+                    tasks.spawn(task(TaskContext {
+                        client: client.clone(),
+                        shared: shared.clone(),
+                    }));
                 }
             },
             Some(n) = notifications.next() => {

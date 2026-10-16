@@ -7,13 +7,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use game_rendezvous::{Config, Host, HostEvent, Listing, Rendezvous, bind_dual_stack};
-use nostr_sdk::prelude::MockRelay;
+use nostr_sdk::prelude::{LocalRelay, RateLimit};
 
 pub struct TestNet {
     pub relay_url: String,
     pub stun: SocketAddr,
-    _relay: MockRelay,
-    _runtime: tokio::runtime::Runtime,
+    _relay: LocalRelay,
+    /// Runs the relay, and anything a test does on the relays directly.
+    pub runtime: tokio::runtime::Runtime,
 }
 
 impl TestNet {
@@ -24,7 +25,15 @@ impl TestNet {
             .enable_all()
             .build()
             .unwrap();
-        let relay = runtime.block_on(MockRelay::run()).unwrap();
+        // No rate limits: tests send floods on purpose.
+        let relay = LocalRelay::builder()
+            .rate_limit(RateLimit {
+                max_reqs: 500,
+                notes_per_minute: u32::MAX,
+            })
+            .messages_per_minute(u32::MAX)
+            .build();
+        runtime.block_on(relay.run()).unwrap();
         let relay_url = runtime.block_on(relay.url()).to_string();
         let stun_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let stun = stun_socket.local_addr().unwrap();
@@ -33,7 +42,7 @@ impl TestNet {
             relay_url,
             stun,
             _relay: relay,
-            _runtime: runtime,
+            runtime,
         }
     }
 

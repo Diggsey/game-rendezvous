@@ -294,3 +294,87 @@ fn joinable_games_are_listed_first() {
     });
     assert_eq!(names, ["Z open game", "A busy game", "A different version"]);
 }
+
+/// Anyone can send a host handshake messages. A flood of them, unreadable or for another
+/// game, is read (or dropped unread) on the worker: none of it reaches the game, and a real
+/// player still gets in.
+#[test]
+fn a_flood_of_junk_requests_does_not_reach_the_game() {
+    use nostr_sdk::prelude::*;
+
+    let net = TestNet::start();
+    let host_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut host = HostGame::new(&host_rv, listing("Flooded"));
+    let mut browser = client_rv.browse();
+    let game = find_game(&mut browser, &mut host, "Flooded");
+
+    // The host's key, from its listing on the relay.
+    let client = Client::default();
+    let host_key = net.runtime.block_on(async {
+        client.add_relay(net.relay_url.as_str()).await.unwrap();
+        client.connect().await;
+        let filter = Filter::new()
+            .kind(Kind::Custom(30078))
+            .identifier("game-rendezvous/game-rendezvous-test");
+        let events = client
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        events.iter().next().expect("the listing").pubkey
+    });
+
+    // 300 unreadable messages, and 50 readable requests for another game.
+    let mut flood = Vec::new();
+    for i in 0..350 {
+        let keys = Keys::generate();
+        let content = if i < 300 {
+            format!("not a NIP-44 payload {i}")
+        } else {
+            let request = serde_json::json!({
+                "type": "request", "attempt": format!("{i}"), "game_id": "another-game",
+                "version": "1.0", "protocol": 1, "player_name": format!("Spam {i}"),
+                "ice": { "ufrag": "x", "pwd": "y", "candidates": [] },
+            });
+            nip44::encrypt(
+                keys.secret_key(),
+                &host_key,
+                request.to_string(),
+                nip44::Version::V2,
+            )
+            .unwrap()
+        };
+        let event = EventBuilder::new(Kind::Custom(21_059), content)
+            .tag(Tag::public_key(host_key))
+            .finalize(&keys)
+            .unwrap();
+        flood.push(event);
+    }
+    net.runtime.block_on(async {
+        for event in &flood {
+            client.send_event(event).await.unwrap();
+        }
+    });
+
+    // A real player joins straight after the flood.
+    let mut join = client_rv.join(&game, "Bob").unwrap();
+    finish_join(&mut join, &mut host).expect("the real player gets in");
+    let connected = wait_for(WAIT, "PeerConnected", || {
+        host.frame();
+        host.events.iter().find_map(|e| match e {
+            HostEvent::PeerConnected { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(connected, "Bob");
+    // The game heard of nobody else: no refusals, no other players.
+    assert!(
+        host.events.iter().all(|e| matches!(
+            e,
+            HostEvent::Listed { .. } | HostEvent::PeerConnected { .. }
+        )),
+        "{:?}",
+        host.events
+    );
+}

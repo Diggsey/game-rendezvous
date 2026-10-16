@@ -9,7 +9,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
-use nostr_sdk::prelude::LocalRelay;
+use nostr_sdk::prelude::{LocalRelay, RateLimit};
 
 #[tokio::main]
 async fn main() {
@@ -22,6 +22,12 @@ async fn main() {
     let relay = LocalRelay::builder()
         .addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .port(relay_port)
+        // Several games on one machine publish more than a public relay's per-client limit.
+        .rate_limit(RateLimit {
+            max_reqs: 500,
+            notes_per_minute: u32::MAX,
+        })
+        .messages_per_minute(u32::MAX)
         .build();
     relay.run().await.expect("the relay starts");
     let stun = UdpSocket::bind((Ipv4Addr::LOCALHOST, stun_port)).expect("the STUN port is free");

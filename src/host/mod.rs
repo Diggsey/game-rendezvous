@@ -1,4 +1,11 @@
 //! Hosting: advertising a game and letting joiners through to the game's socket.
+//!
+//! The work is split between two threads. The game thread ([`Host`]) owns what needs the
+//! game's socket: learning the public address and the connectivity checks. The worker
+//! ([`relay`]) owns what needs the host's keys: the listing, and reading and answering join
+//! requests. They exchange plain data.
+
+mod relay;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -6,28 +13,25 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr_sdk::prelude::{Event, Filter, Keys, PublicKey, SubscriptionId, Timestamp};
+use nostr_sdk::prelude::{Filter, Keys, PublicKey, SubscriptionId, Timestamp};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use crate::Inner;
-use crate::handshake::{self, HANDSHAKE_KIND, Message, RefuseReason};
+use crate::handshake::{HANDSHAKE_KIND, RefuseReason};
 use crate::ice::{self, Link, LocalCandidates};
-use crate::listing::{Listing, PROTOCOL, listing_event};
+use crate::listing::Listing;
 use crate::net::{self, LocalAddr};
 use crate::portmap::PortMapEvent;
-use crate::signal::{self, Command, Inbox, Published};
+use crate::signal::{self, Command, Inbox, Published, Sink};
 use crate::stun::{self, Gatherer};
+use relay::{FromRelay, JoinRequest, Relay, ToRelay};
 
-/// Joiners being connected at once; more are told to wait.
-const MAX_JOINERS: usize = 16;
 /// How long a connected joiner's checks are still answered, for its retransmissions.
 const LINGER: Duration = Duration::from_secs(5);
 /// How often the public address is checked again with the STUN servers. This also keeps the
 /// NAT's mapping for the socket alive while nobody is connected.
 const REGATHER: Duration = Duration::from_secs(25);
-/// The quickest a changed listing is republished.
-const PUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What happened while hosting, from [`Host::poll`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,12 +65,9 @@ pub struct HostStatus {
 
 /// A joiner in the middle of connecting.
 struct Joiner {
-    attempt: String,
     name: String,
     link: Link,
     started: Instant,
-    /// The accept message, sent again if the joiner repeats its request.
-    accept: Event,
     connected_at: Option<Instant>,
 }
 
@@ -77,15 +78,13 @@ pub struct Host {
     inner: Arc<Inner>,
     /// A clone of the game's socket, for sending.
     socket: UdpSocket,
-    keys: Keys,
     started: Instant,
 
     listing: Listing,
-    listing_changed: bool,
-    last_publish: Option<Instant>,
-    /// The date of the last listing published.
-    last_listing: Option<Timestamp>,
-    publishing: Option<Inbox<Published>>,
+    /// Dropping it ends the relay task, which closes the listing.
+    to_relay: Sink<ToRelay>,
+    from_relay: Inbox<FromRelay>,
+    published: Inbox<Published>,
     listed_on: usize,
 
     locals: Vec<LocalAddr>,
@@ -100,9 +99,8 @@ pub struct Host {
     _port_mapping_stop: Option<oneshot::Sender<()>>,
 
     subscription: SubscriptionId,
-    requests: Inbox<Event>,
     /// Requests that came before the public address was known.
-    early_requests: Vec<Event>,
+    early_requests: Vec<JoinRequest>,
     joiners: HashMap<PublicKey, Joiner>,
     events: VecDeque<HostEvent>,
 }
@@ -135,16 +133,32 @@ impl Host {
             inner.config.game_id,
             keys.public_key()
         );
+        let (to_relay, commands) = signal::channel();
+        let (notices, from_relay) = signal::channel();
+        let (published_tx, published) = signal::channel();
+        let relay_parts = (inner.config.clone(), listing.clone());
+        inner.signal.spawn(move |ctx| {
+            let (config, listing) = relay_parts;
+            Relay {
+                ctx,
+                config,
+                keys,
+                listing,
+                commands,
+                requests,
+                notices,
+                published: published_tx,
+            }
+            .run()
+        });
         Ok(Host {
             inner,
             socket,
-            keys,
             started: Instant::now(),
             listing,
-            listing_changed: true,
-            last_publish: None,
-            last_listing: None,
-            publishing: None,
+            to_relay,
+            from_relay,
+            published,
             listed_on: 0,
             locals,
             port,
@@ -155,7 +169,6 @@ impl Host {
             port_mapping: None,
             _port_mapping_stop: stop,
             subscription,
-            requests,
             early_requests: Vec::new(),
             joiners: HashMap::new(),
             events: VecDeque::new(),
@@ -189,7 +202,7 @@ impl Host {
             let now = Instant::now();
             self.gather(now);
             self.port_mapping_events();
-            self.publish(now);
+            self.listing_outcomes();
             self.join_requests(now);
             self.drive_joiners(now);
         }
@@ -199,8 +212,8 @@ impl Host {
     /// Changes the listing (players, metadata, ...); it is republished shortly.
     pub fn set_listing(&mut self, listing: Listing) {
         if listing != self.listing {
-            self.listing = listing;
-            self.listing_changed = true;
+            self.listing = listing.clone();
+            let _ = self.to_relay.send(ToRelay::SetListing(listing));
         }
     }
 
@@ -295,11 +308,9 @@ impl Host {
         }
     }
 
-    fn publish(&mut self, now: Instant) {
-        if let Some(rx) = &mut self.publishing
-            && let Ok(p) = rx.try_recv()
-        {
-            self.publishing = None;
+    /// The relays' answers to the listings the relay task published.
+    fn listing_outcomes(&mut self) {
+        while let Ok(p) = self.published.try_recv() {
             if p.accepted == 0 {
                 warn!("listing not published: {}", p.errors.join("; "));
                 self.events
@@ -310,125 +321,46 @@ impl Host {
             }
             self.listed_on = p.accepted;
         }
-        let due = match self.last_publish {
-            None => true,
-            Some(t) => {
-                now - t >= self.inner.config.listing_refresh
-                    || (self.listing_changed && now - t >= PUBLISH_MIN_INTERVAL)
-            }
-        };
-        if !due || self.publishing.is_some() {
-            return;
-        }
-        let previous = self.last_listing;
-        match listing_event(
-            &self.inner.config,
-            &self.keys,
-            &self.listing,
-            false,
-            previous,
-        ) {
-            Some(event) => {
-                self.last_listing = Some(event.created_at);
-                self.publishing = Some(self.inner.signal.publish_tracked(event));
-                self.last_publish = Some(now);
-                self.listing_changed = false;
-            }
-            None => warn!("could not sign the listing"),
-        }
     }
 
+    /// Join requests the relay task accepted (and refusals it sent).
     fn join_requests(&mut self, now: Instant) {
-        let mut requests: Vec<Event> = Vec::new();
-        if self.ready(now) {
-            requests.append(&mut self.early_requests);
-        }
-        while let Ok(e) = self.requests.try_recv() {
-            requests.push(e);
-        }
-        for event in requests {
-            if !self.ready(now) {
-                if self.early_requests.len() < MAX_JOINERS {
-                    self.early_requests.push(event);
-                }
-                continue;
+        while let Ok(notice) = self.from_relay.try_recv() {
+            match notice {
+                FromRelay::Request(r) => self.early_requests.push(r),
+                FromRelay::Refused { name, reason } => self
+                    .events
+                    .push_back(HostEvent::JoinRefused { name, reason }),
             }
-            self.join_request(now, &event);
+        }
+        // Joiners get every candidate there will be, so they wait for the public address.
+        if !self.ready(now) {
+            return;
+        }
+        for r in std::mem::take(&mut self.early_requests) {
+            self.join_request(now, r);
         }
     }
 
-    fn join_request(&mut self, now: Instant, event: &Event) {
-        let Some(Message::Request {
-            attempt,
-            game_id,
-            version,
-            protocol,
-            player_name,
-            ice,
-        }) = handshake::open(&self.keys, event)
-        else {
-            return;
-        };
-        let config = &self.inner.config;
-        if game_id != config.game_id {
-            return;
-        }
-        let from = event.pubkey;
-        if let Some(j) = self.joiners.get(&from)
-            && j.attempt == attempt
-        {
-            // The joiner did not hear the answer yet.
-            self.inner.signal.publish(j.accept.clone());
-            return;
-        }
-        let refusal = if protocol != PROTOCOL || !config.is_compatible(&version) {
-            Some(RefuseReason::IncompatibleVersion {
-                host_version: config.game_version.clone(),
-            })
-        } else if !self.listing.joinable {
-            Some(RefuseReason::NotAccepting)
-        } else if self.joiners.len() >= MAX_JOINERS {
-            Some(RefuseReason::Busy)
-        } else {
-            None
-        };
-        if let Some(reason) = refusal {
-            info!("refusing {player_name} (version {version}): {reason:?}");
-            let refuse = Message::Refuse {
-                attempt,
-                reason: reason.clone(),
-            };
-            if let Some(e) = handshake::seal(&self.keys, &from, &refuse) {
-                self.inner.signal.publish(e);
-            }
-            self.events.push_back(HostEvent::JoinRefused {
-                name: player_name,
-                reason,
-            });
-            return;
-        }
+    fn join_request(&mut self, now: Instant, r: JoinRequest) {
         let mut link = Link::new(false, &self.candidates());
-        link.set_remote(&ice);
-        let accept = Message::Accept {
-            attempt: attempt.clone(),
-            ice: link.params(),
-        };
-        let Some(accept) = handshake::seal(&self.keys, &from, &accept) else {
-            return;
-        };
+        link.set_remote(&r.ice);
         info!(
-            "{player_name} is joining: checking {} addresses",
+            "{} is joining: checking {} addresses",
+            r.player_name,
             link.remote_candidates()
         );
-        self.inner.signal.publish(accept.clone());
+        let _ = self.to_relay.send(ToRelay::Accept {
+            to: r.from,
+            attempt: r.attempt,
+            ice: link.params(),
+        });
         self.joiners.insert(
-            from,
+            r.from,
             Joiner {
-                attempt,
-                name: player_name,
+                name: r.player_name,
                 link,
                 started: now,
-                accept,
                 connected_at: None,
             },
         );
@@ -463,19 +395,14 @@ impl Host {
         }
         for key in done {
             self.joiners.remove(&key);
+            let _ = self.to_relay.send(ToRelay::JoinerDone(key));
         }
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // Replace the listing with a tombstone so that browsers drop it now, not at expiry.
-        let (config, previous) = (&self.inner.config, self.last_listing);
-        if previous.is_some()
-            && let Some(e) = listing_event(config, &self.keys, &self.listing, true, previous)
-        {
-            self.inner.signal.publish(e);
-        }
+        // The relay task sees `to_relay` close, and replaces the listing with a tombstone.
         self.inner
             .signal
             .send(Command::Unsubscribe(self.subscription.clone()));

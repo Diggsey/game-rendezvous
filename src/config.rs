@@ -59,6 +59,11 @@ pub struct Config {
     pub handshake_timeout: Duration,
     /// How long connectivity checks may take once both sides know each other's addresses.
     pub connect_timeout: Duration,
+    /// How many handshake messages a host (or joiner) decrypts per second, on the worker
+    /// thread. Anyone can send a host handshake messages; beyond this many a second they are
+    /// dropped unread, so a flood costs bounded work. Joiners repeat their requests, so a real
+    /// one still gets through a flood that is not overwhelming.
+    pub handshake_rate: u32,
 }
 
 impl Config {
@@ -78,6 +83,7 @@ impl Config {
             gather_timeout: Duration::from_millis(1500),
             handshake_timeout: Duration::from_secs(12),
             connect_timeout: Duration::from_secs(10),
+            handshake_rate: 100,
         }
     }
 
