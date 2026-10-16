@@ -1,0 +1,30 @@
+[package]
+name = "game_rendezvous"
+version = "0.1.0"
+edition = "2024"
+description = "Internet game discovery over Nostr relays and peer-to-peer UDP connections through NATs"
+publish = false
+
+[dependencies]
+# NAT-PMP and PCP port mapping.
+crab_nat = "0.8"
+# UPnP IGD port mapping.
+igd-next = { version = "0.18", features = ["aio_tokio"] }
+# str0m's sans-IO ICE agent: connectivity checks over a socket we own.
+is = "0.11"
+# The machine's interfaces, addresses and default gateway.
+netdev = "0.46"
+# NIP-44 encryption of the join handshake (nostr-sdk enables only the core of `nostr`).
+nostr = { version = "0.45", features = ["nip44"] }
+nostr-sdk = "0.45"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+tracing = "0.1"
+
+[dev-dependencies]
+nostr-sdk = { version = "0.45", features = ["local-relay"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
