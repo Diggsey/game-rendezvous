@@ -57,16 +57,10 @@ impl fmt::Display for JoinError {
             } => {
                 write!(
                     f,
-                    "no network path to the host worked ({tried} address{} tried). The host can \
-                     enable UPnP on their router or forward their game's UDP port",
-                    if *tried == 1 { "" } else { "es" }
+                    "no network path to the host worked ({tried} tried); the host can turn on                      UPnP or forward their UDP port"
                 )?;
                 if *symmetric_nat {
-                    write!(
-                        f,
-                        "; your router changes ports for every destination (symmetric NAT), \
-                         which blocks direct connections to closed hosts"
-                    )?;
+                    write!(f, " (your router's symmetric NAT blocks hole punching)")?;
                 }
                 Ok(())
             }
