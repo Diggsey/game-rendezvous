@@ -96,6 +96,9 @@ impl Join {
                 theirs: game.version.clone(),
             });
         }
+        if !game.joinable {
+            return Err(JoinError::NotJoinable);
+        }
         socket.set_nonblocking(true)?;
         let port = socket.local_addr()?.port();
         let locals = net::local_addrs(&socket, inner.config.local_addresses.as_deref());

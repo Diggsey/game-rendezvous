@@ -129,6 +129,7 @@ pub fn listing(name: &str) -> Listing {
         name: name.into(),
         players: 1,
         max_players: 4,
+        joinable: true,
         metadata: [("mode".to_string(), "deathmatch".to_string())].into(),
     }
 }

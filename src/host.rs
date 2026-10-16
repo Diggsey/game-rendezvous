@@ -385,6 +385,8 @@ impl Host {
             Some(RefuseReason::IncompatibleVersion {
                 host_version: config.game_version.clone(),
             })
+        } else if !self.listing.joinable {
+            Some(RefuseReason::NotAccepting)
         } else if self.joiners.len() >= MAX_JOINERS {
             Some(RefuseReason::Busy)
         } else {

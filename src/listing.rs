@@ -25,14 +25,30 @@ pub(crate) const LISTING_KIND: Kind = Kind::Custom(30078);
 pub(crate) const PROTOCOL: u32 = 1;
 
 /// What a host advertises about its game. `metadata` is the game's own (mode, map, ...).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     /// The game's name as players see it, e.g. the host's player name.
     pub name: String,
     pub players: u32,
     pub max_players: u32,
+    /// Whether players can join now. A game whose match is under way (or that is full) can
+    /// stay listed with this off: browsers show it as not joinable, and the host refuses
+    /// joins until it is on again.
+    pub joinable: bool,
     /// Free-form key-values for the game to show (mode, level, "in match", ...).
     pub metadata: BTreeMap<String, String>,
+}
+
+impl Default for Listing {
+    fn default() -> Self {
+        Listing {
+            name: String::new(),
+            players: 0,
+            max_players: 0,
+            joinable: true,
+            metadata: BTreeMap::new(),
+        }
+    }
 }
 
 /// Identifies an advertised game: the public key its host signs with.
@@ -58,6 +74,8 @@ pub struct GameInfo {
     pub compatible: bool,
     pub players: u32,
     pub max_players: u32,
+    /// Whether the host takes players now (see [`Listing::joinable`]).
+    pub joinable: bool,
     pub metadata: BTreeMap<String, String>,
     /// When the host last refreshed the listing (the host's clock).
     pub updated: SystemTime,
@@ -73,11 +91,18 @@ struct Content {
     version: String,
     players: u32,
     max_players: u32,
+    /// Listings from before this field are joinable.
+    #[serde(default = "yes")]
+    joinable: bool,
     #[serde(default)]
     metadata: BTreeMap<String, String>,
     /// A tombstone: the game has closed.
     #[serde(default)]
     closed: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The `d` tag value of a game's listings: relays filter on it.
@@ -102,6 +127,7 @@ pub(crate) fn listing_event(
         version: config.game_version.clone(),
         players: listing.players,
         max_players: listing.max_players,
+        joinable: listing.joinable,
         metadata: listing.metadata.clone(),
         closed,
     };
@@ -154,6 +180,7 @@ pub(crate) fn parse_listing(config: &Config, event: &Event) -> Option<Parsed> {
         compatible,
         players: content.players,
         max_players: content.max_players,
+        joinable: content.joinable,
         metadata: content.metadata,
         updated: to_system_time(event.created_at),
         expires: to_system_time(expires),

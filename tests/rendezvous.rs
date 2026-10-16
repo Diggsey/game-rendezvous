@@ -231,3 +231,66 @@ fn unreachable_relays_are_reported() {
         "{result:?}"
     );
 }
+
+#[test]
+fn games_not_taking_players_are_listed_but_not_joinable() {
+    let net = TestNet::start();
+    let host_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut host = HostGame::new(&host_rv, listing("Busy"));
+    let mut browser = client_rv.browse();
+    let before = find_game(&mut browser, &mut host, "Busy");
+    assert!(before.joinable);
+
+    // A match starts: the game stays listed, as not joinable.
+    let mut playing = listing("Busy");
+    playing.joinable = false;
+    host.host.set_listing(playing);
+    let during = wait_for(WAIT, "the game to show as not joinable", || {
+        host.frame();
+        browser.poll();
+        browser.games().iter().find(|g| !g.joinable).cloned()
+    });
+    assert!(during.compatible);
+    assert!(matches!(
+        client_rv.join(&during, "Bob"),
+        Err(JoinError::NotJoinable)
+    ));
+    // A player whose list is out of date is refused by the host.
+    let mut join = client_rv.join(&before, "Late").unwrap();
+    match finish_join(&mut join, &mut host) {
+        Err(JoinError::Refused(RefuseReason::NotAccepting)) => {}
+        other => panic!("expected the host to refuse, got {other:?}"),
+    }
+
+    // Back in the lobby: joinable again.
+    host.host.set_listing(listing("Busy"));
+    wait_for(WAIT, "the game to be joinable again", || {
+        host.frame();
+        browser.poll();
+        browser.games().iter().find(|g| g.joinable).map(|_| ())
+    });
+}
+
+#[test]
+fn joinable_games_are_listed_first() {
+    let net = TestNet::start();
+    let rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let old_rv = Rendezvous::new(net.config("0.9")).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut busy = listing("A busy game");
+    busy.joinable = false;
+    let mut hosts = [
+        HostGame::new(&old_rv, listing("A different version")),
+        HostGame::new(&rv, busy),
+        HostGame::new(&rv, listing("Z open game")),
+    ];
+    let mut browser = client_rv.browse();
+    let names = wait_for(WAIT, "all three games", || {
+        hosts.iter_mut().for_each(HostGame::frame);
+        browser.poll();
+        let names: Vec<String> = browser.games().iter().map(|g| g.name.clone()).collect();
+        (names.len() == 3).then_some(names)
+    });
+    assert_eq!(names, ["Z open game", "A busy game", "A different version"]);
+}

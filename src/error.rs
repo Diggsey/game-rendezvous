@@ -8,6 +8,8 @@ use crate::handshake::RefuseReason;
 pub enum JoinError {
     /// The game runs a version this build cannot play with (decided locally from the listing).
     IncompatibleVersion { ours: String, theirs: String },
+    /// The listing says the host is not taking players now (decided locally).
+    NotJoinable,
     /// The host refused.
     Refused(RefuseReason),
     /// No relay took the join request.
@@ -37,8 +39,8 @@ impl fmt::Display for JoinError {
                 f,
                 "the host runs version {host_version}, which does not accept yours"
             ),
-            JoinError::Refused(RefuseReason::NotAccepting) => {
-                write!(f, "the host is not accepting players")
+            JoinError::NotJoinable | JoinError::Refused(RefuseReason::NotAccepting) => {
+                write!(f, "the host is not taking players right now")
             }
             JoinError::Refused(RefuseReason::Busy) => write!(
                 f,

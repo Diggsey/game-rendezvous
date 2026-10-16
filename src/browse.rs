@@ -74,17 +74,13 @@ impl Browser {
 
     fn sort(&mut self) {
         self.sorted = self.found.values().map(|(g, _)| g.clone()).collect();
-        // Joinable games first, then by name; the id keeps the order stable.
-        self.sorted.sort_by(|a, b| {
-            (!a.compatible, a.name.to_lowercase(), a.id).cmp(&(
-                !b.compatible,
-                b.name.to_lowercase(),
-                b.id,
-            ))
-        });
+        // Joinable games first, then those of this version that are not taking players, then
+        // other versions; by name within each, the id keeping the order stable.
+        let key = |g: &GameInfo| (!g.compatible, !g.joinable, g.name.to_lowercase(), g.id);
+        self.sorted.sort_by_cached_key(key);
     }
 
-    /// The games found, joinable ones first.
+    /// The games found: joinable ones first, then ones not taking players, then other versions.
     pub fn games(&self) -> &[GameInfo] {
         &self.sorted
     }

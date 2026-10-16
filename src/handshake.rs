@@ -48,7 +48,7 @@ pub(crate) enum Message {
 pub enum RefuseReason {
     /// The host's version does not accept the joiner's.
     IncompatibleVersion { host_version: String },
-    /// The host has stopped advertising, or is not accepting players.
+    /// The host is not taking players now (its listing is not joinable).
     NotAccepting,
     /// The host is handling too many join attempts at once.
     Busy,
