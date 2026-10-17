@@ -14,29 +14,38 @@ punches a UDP path through both sides' NATs. The game gets back a plain non-bloc
   relays, encrypted to each other ([NIP-44](https://github.com/nostr-protocol/nips/blob/master/44.md)),
   in ephemeral events that relays pass on but do not store.
 - **Connection.** Candidates come from the machine's LAN and IPv6 addresses, public STUN servers
-  (asked from the game's own socket) and a port the host's router was asked to open (UPnP,
-  NAT-PMP or PCP). Both sides run ICE connectivity checks over the game's socket, and the best
-  path that works wins.
+  (asked from the game's own socket), a port the host's router was asked to open (UPnP,
+  NAT-PMP or PCP), predicted ports for routers that hand them out in sequence, and the host's
+  TURN relay if it has one. Both sides run ICE connectivity checks over the game's socket, and
+  the best path that works wins. When one router hands out random ports and the other does
+  not, the strict side opens 256 sockets and the other probes random ports until two meet.
+- **Reachability.** A host can check before hosting whether players could probably reach it,
+  and hears when a player could not. Listings carry a summary of the host's router, so a
+  player's list can mark games it probably cannot join.
+- **Relays.** A host can add a TURN relay, which lets in every player at the cost of a detour.
+  The crate lists TURN providers with a free tier (`DEFAULT_RELAY_PROVIDERS`), each with a
+  sign-up link and the credentials to enter, and fetches short-lived credentials from the
+  providers that issue them over an API. Only the host needs an account.
 
 Everything is poll-based and never blocks, for calling from a game loop. The relay work runs on
 one background thread with its own Tokio runtime, so the game needs no async runtime.
 
 ## Hosting
 
+The host plays on a `GameSocket`, shared with the library: the game sends and receives through
+it, and it keeps the library's datagrams for the host and carries relayed players' traffic.
+
 ```rust,no_run
-use game_rendezvous::{Config, HostEvent, Listing, Rendezvous, bind_dual_stack, canonical};
+use game_rendezvous::{Config, GameSocket, HostEvent, Listing, Rendezvous};
 
 let rv = Rendezvous::new(Config::new("my-game", "1.2.0"))?;
-let socket = bind_dual_stack(7777)?;
+let socket = GameSocket::bind(7777)?;
 let listing = Listing { name: "Ann's game".into(), max_players: 4, ..Default::default() };
 let mut host = rv.host(&socket, listing)?;
 let mut buf = [0u8; 65_536];
 loop {
     while let Ok((n, from)) = socket.recv_from(&mut buf) {
-        let from = canonical(from);
-        if !host.handle_datagram(from, &buf[..n]) {
-            // The game's own packet.
-        }
+        // The game's own packet.
     }
     while let Some(event) = host.poll() {
         if let HostEvent::PeerConnected { addr, name, .. } = event {
@@ -44,6 +53,25 @@ loop {
         }
     }
 }
+```
+
+## Relays
+
+```rust,no_run
+use std::collections::BTreeMap;
+use game_rendezvous::{Config, DEFAULT_RELAY_PROVIDERS};
+
+// The game's relay settings list the providers, with their sign-up links and fields...
+for p in DEFAULT_RELAY_PROVIDERS {
+    println!("{}: {} ({})", p.name, p.signup_url, p.notes);
+}
+// ...and turn what the player entered into the host's relay.
+let values = BTreeMap::from([
+    ("username".to_string(), "ann".to_string()),
+    ("password".to_string(), "secret".to_string()),
+]);
+let relay = DEFAULT_RELAY_PROVIDERS[0].config(&values)?;
+let config = Config::new("my-game", "1.2.0").with_turn(relay);
 ```
 
 ## Joining
@@ -63,7 +91,7 @@ loop {
 ```
 
 See the [crate documentation](https://docs.rs/game_rendezvous) for the details: shutting down,
-what a host bounds against strangers, and the `port-mapping` feature.
+what a host bounds against strangers, and the `port-mapping` and `relay-api` features.
 
 ## Trying it locally
 
@@ -76,11 +104,13 @@ cargo run --example test_network -- 7000 3478
 
 Point the game at them with `Config::with_relays(["ws://127.0.0.1:7000"])` and
 `Config::with_stun_servers(["127.0.0.1:3478"])`. The `probe` example checks what this machine
-can do for hosting: which relays connect, its public address, and whether its router opens a
-port.
+can do for hosting: its router's behaviour, whether players could reach it, which relays
+connect, whether its router opens a port, and optionally a TURN relay.
 
-`cargo test` runs the end-to-end tests on a private network on localhost. The tests against the
-public relays are ignored by default: `cargo test --test public -- --ignored`.
+`cargo test` runs the end-to-end tests on a private network on localhost, and the NAT traversal
+tests on a simulated internet of routers of every kind. The tests against the public relays are
+ignored by default: `cargo test --test public -- --ignored`. So is the test against a real TURN
+server: `GR_TEST_TURN=host:port,user,pass cargo test --test turn -- --ignored`.
 
 ## Minimum Rust version
 

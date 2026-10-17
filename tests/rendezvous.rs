@@ -5,7 +5,9 @@ mod common;
 use std::time::Duration;
 
 use common::{HANDSHAKE_KIND, HostGame, TestNet, forged_request, listing, wait_for};
-use game_rendezvous::{Connection, GameInfo, HostEvent, JoinError, RefuseReason, Rendezvous};
+use game_rendezvous::{
+    Connection, GameInfo, HostEvent, JoinError, JoinFailure, PeerPath, RefuseReason, Rendezvous,
+};
 use nostr_sdk::prelude::Filter;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -77,8 +79,9 @@ fn listing_expires_without_refresh() {
     let mut host = HostGame::new(&host_rv, listing("Short-lived"));
     let mut browser = browse_rv.browse();
     find_game(&mut browser, &mut host, "Short-lived");
-    // The host lives on but stops refreshing (as if hung): the listing expires.
-    wait_for(Duration::from_secs(5), "the listing to expire", || {
+    // The host lives on but stops refreshing (as if hung): the listing expires. (Listings
+    // live 5 s at least, and the first may be replaced once the host's router is known.)
+    wait_for(Duration::from_secs(8), "the listing to expire", || {
         browser.poll();
         browser.games().is_empty().then_some(())
     });
@@ -144,9 +147,10 @@ fn join_connects_on_localhost() {
     // The host learned its public address from the STUN server (localhost, here).
     let status = host.host.status();
     assert_eq!(
-        status.public_addresses,
+        status.nat.public_addresses,
         vec![format!("127.0.0.1:{}", host.port()).parse().unwrap()]
     );
+    assert_eq!(status.failed_joins, 0);
 
     // Game traffic flows both ways on the connected sockets.
     assert!(
@@ -163,13 +167,17 @@ fn join_connects_on_localhost() {
     });
     let connected = wait_for(WAIT, "PeerConnected", || {
         host.frame();
-        host.events.iter().find_map(|e| match e {
-            HostEvent::PeerConnected { addr, name } => Some((*addr, name.clone())),
-            _ => None,
-        })
+        host.connected()
     });
     assert_eq!(connected, (client_addr, "Bob".to_string()));
-    game_rendezvous::send_to(&host.socket, b"hello client", client_addr).unwrap();
+    assert!(host.events.iter().any(|e| matches!(
+        e,
+        HostEvent::PeerConnected {
+            path: PeerPath::Direct,
+            ..
+        }
+    )));
+    host.socket.send_to(b"hello client", client_addr).unwrap();
     let mut buf = [0u8; 64];
     let reply = wait_for(WAIT, "the host's datagram", || {
         // The host's last checks may still arrive; skip them.
@@ -199,6 +207,19 @@ fn unreachable_host_is_reported() {
         }
         other => panic!("expected NoRoute, got {other:?}"),
     }
+    // The joiner tells the host, which counts a player who could not get in.
+    let reason = wait_for(WAIT, "the joiner's report", || {
+        host.frame();
+        host.events.iter().find_map(|e| match e {
+            HostEvent::PeerFailed { name, reason } if name == "Bob" => Some(*reason),
+            _ => None,
+        })
+    });
+    assert!(
+        matches!(reason, JoinFailure::Unreachable { .. }),
+        "{reason:?}"
+    );
+    assert_eq!(host.host.status().failed_joins, 1);
 }
 
 #[test]
@@ -206,7 +227,8 @@ fn silent_host_is_reported() {
     let net = TestNet::start();
     let host_rv = Rendezvous::new(net.config("1.0")).unwrap();
     let mut config = net.config("1.0");
-    config.handshake_timeout = Duration::from_secs(2);
+    // Between two repeats of the request (every 2 s), so none is in flight as it fails.
+    config.handshake_timeout = Duration::from_secs(3);
     let client_rv = Rendezvous::new(config).unwrap();
     let mut host = HostGame::new(&host_rv, listing("Silent"));
     let mut browser = client_rv.browse();
@@ -350,17 +372,14 @@ fn a_flood_of_junk_requests_does_not_reach_the_game() {
     finish_join(&mut join, &mut host).expect("the real player gets in");
     let connected = wait_for(WAIT, "PeerConnected", || {
         host.frame();
-        host.events.iter().find_map(|e| match e {
-            HostEvent::PeerConnected { name, .. } => Some(name.clone()),
-            _ => None,
-        })
+        host.connected()
     });
-    assert_eq!(connected, "Bob");
+    assert_eq!(connected.1, "Bob");
     // The game heard of nobody else: no refusals, no other players.
     assert!(
         host.events.iter().all(|e| matches!(
             e,
-            HostEvent::Listed { .. } | HostEvent::PeerConnected { .. }
+            HostEvent::Listed { .. } | HostEvent::Network(_) | HostEvent::PeerConnected { .. }
         )),
         "{:?}",
         host.events
@@ -405,12 +424,8 @@ fn greet(host: &mut HostGame, greeted: &mut bool) {
     if *greeted {
         return;
     }
-    let connected = host.events.iter().find_map(|e| match e {
-        HostEvent::PeerConnected { addr, .. } => Some(*addr),
-        _ => None,
-    });
-    if let Some(addr) = connected {
-        game_rendezvous::send_to(&host.socket, b"welcome", addr).unwrap();
+    if let Some((addr, _)) = host.connected() {
+        host.socket.send_to(b"welcome", addr).unwrap();
         *greeted = true;
     }
 }
@@ -501,19 +516,34 @@ fn silent_joiners_hold_their_places_only_briefly() {
     }
 
     // Well before the connection timeout, the silent ones are let go.
+    for _ in 0..700 {
+        host.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut join = client_rv.join(&game, "Bob").unwrap();
+    finish_join(&mut join, &mut host).expect("a place for a real player");
+    // They are reported once they have had time to say why they failed (a real joiner whose
+    // checks never reached the host would), and do not count as players who could not get in.
     wait_for(
-        Duration::from_secs(10),
-        "the silent joiners to be let go",
+        Duration::from_secs(30),
+        "the silent joiners to be reported",
         || {
             host.frame();
             let failed = host
                 .events
                 .iter()
-                .filter(|e| matches!(e, HostEvent::PeerFailed { .. }))
+                .filter(|e| {
+                    matches!(
+                        e,
+                        HostEvent::PeerFailed {
+                            reason: JoinFailure::Silent,
+                            ..
+                        }
+                    )
+                })
                 .count();
             (failed == 16).then_some(())
         },
     );
-    let mut join = client_rv.join(&game, "Bob").unwrap();
-    finish_join(&mut join, &mut host).expect("a place for a real player");
+    assert_eq!(host.host.status().failed_joins, 0);
 }

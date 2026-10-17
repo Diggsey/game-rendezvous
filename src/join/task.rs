@@ -1,6 +1,7 @@
 //! The joiner's side of the relays, on the worker thread: sealing its join request, repeating
-//! it until the host answers, and opening the answer. The game thread sends the request's
-//! contents and gets the host's answer back as plain data.
+//! it until the host answers, and opening the answer; then, if no path worked, telling the
+//! host so. The game thread sends the messages' contents and gets the host's answer back as
+//! plain data.
 
 use std::time::Duration;
 
@@ -14,8 +15,13 @@ use crate::worker::{Inbox, Published, Sink, TaskContext};
 /// ephemeral event.
 const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 
-/// From the game thread: the request to send, once this side's candidates are known.
-pub(super) struct SendRequest(pub Message);
+/// From the game thread.
+pub(super) enum ToTask {
+    /// The request to send, once this side's candidates are known.
+    Request(Message),
+    /// No path worked: tell the host (once).
+    Report(Message),
+}
 
 /// To the game thread.
 pub(super) enum FromTask {
@@ -40,7 +46,7 @@ pub(super) struct JoinTask {
     /// Handshake messages decrypted a second at most.
     pub(super) handshake_rate: u32,
     /// From the game thread; closed when the join ends.
-    pub(super) commands: Inbox<SendRequest>,
+    pub(super) commands: Inbox<ToTask>,
     /// Handshake events from the host.
     pub(super) replies: Inbox<Event>,
     /// To the game thread.
@@ -48,9 +54,9 @@ pub(super) struct JoinTask {
 }
 
 impl JoinTask {
-    /// Runs until the host answers or the game drops its end.
+    /// Runs until the game drops its end.
     pub(super) async fn run(mut self) {
-        let Some(SendRequest(request)) = self.commands.recv().await else {
+        let Some(ToTask::Request(request)) = self.commands.recv().await else {
             return;
         };
         let (published_tx, mut published) = crate::worker::channel();
@@ -72,7 +78,12 @@ impl JoinTask {
         loop {
             tokio::select! {
                 // The game dropped the join, or it finished.
-                None = self.commands.recv() => return,
+                command = self.commands.recv() => match command {
+                    Some(ToTask::Report(m)) => {
+                        self.ctx.send_sealed(&self.keys, &self.host, &m, None);
+                    }
+                    _ => return,
+                },
                 Some(p) = published.recv() => {
                     if !taken {
                         taken = p.accepted > 0;
@@ -86,9 +97,15 @@ impl JoinTask {
                 Some(reply) = self.replies.recv() => {
                     if let Some(answer) = self.open(&mut budget, &reply) {
                         let _ = self.notices.send(answer);
-                        return;
+                        break;
                     }
                 }
+            }
+        }
+        // Answered: the game may still have word for the host, until it lets go.
+        while let Some(command) = self.commands.recv().await {
+            if let ToTask::Report(m) = command {
+                self.ctx.send_sealed(&self.keys, &self.host, &m, None);
             }
         }
     }

@@ -26,9 +26,8 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 pub(crate) type TransactionId = [u8; 12];
 
 /// Whether `data` looks like a STUN message (of any kind): the first two bits zero and the
-/// magic cookie in place. A game sharing its socket with this crate should give such datagrams
-/// to [`Host::handle_datagram`](crate::Host::handle_datagram) and make sure its own packets
-/// never look like this.
+/// magic cookie in place. A [`GameSocket`](crate::GameSocket) keeps such datagrams for the
+/// library, so a game's own packets must never look like this.
 ///
 /// ```
 /// assert!(!game_rendezvous::is_stun(b"a game's own packet, which starts with a letter"));
@@ -286,26 +285,12 @@ impl Gatherer {
             || self.first_answer.is_some_and(|t| now >= t + STRAGGLERS)
     }
 
-    /// The distinct addresses the servers saw.
-    pub(crate) fn mapped(&self) -> Vec<SocketAddr> {
-        let mut out: Vec<SocketAddr> = Vec::new();
-        for (_, a) in &self.answers {
-            if !out.contains(a) {
-                out.push(*a);
-            }
-        }
-        out
-    }
-
-    /// Whether different servers saw different IPv4 ports: the NAT maps each destination to a
-    /// new port ("symmetric"), which defeats hole punching unless the other side is open.
-    pub(crate) fn symmetric_nat(&self) -> bool {
-        let mut ports = self
-            .answers
-            .iter()
-            .filter(|(_, a)| a.is_ipv4())
-            .map(|(_, a)| a.port());
-        ports.next().is_some_and(|first| ports.any(|p| p != first))
+    /// The address each answering server saw, in the order the servers were first asked:
+    /// the order the router made its mappings, which tells sequential port allocation.
+    pub(crate) fn observed(&self) -> Vec<SocketAddr> {
+        let mut answers = self.answers.clone();
+        answers.sort_by_key(|(server, _)| self.servers.iter().position(|s| s == server));
+        answers.into_iter().map(|(_, a)| a).collect()
     }
 }
 
@@ -339,7 +324,6 @@ mod tests {
         let reply = respond(&first[0].1, me).unwrap();
         assert!(g.handle(t0 + Duration::from_millis(350), &reply));
         assert!(g.is_done(t0 + Duration::from_millis(350)));
-        assert_eq!(g.mapped(), vec![me]);
-        assert!(!g.symmetric_nat());
+        assert_eq!(g.observed(), vec![me]);
     }
 }

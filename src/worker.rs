@@ -23,6 +23,7 @@ use tokio::sync::{mpsc as tmpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
+use crate::config::TurnConfig;
 use crate::handshake::{self, Message};
 use crate::portmap::{self, PortMapEvent};
 
@@ -78,11 +79,59 @@ pub(crate) enum Command {
         /// Fires (or is dropped) when the host stops.
         stop: oneshot::Receiver<()>,
     },
+    /// Gets a TURN server's credentials (from its provider, if it has one) and looks its
+    /// address up.
+    ResolveTurn {
+        /// The server, or its provider.
+        config: TurnConfig,
+        /// Where the outcome goes.
+        reply: Sink<Result<ResolvedTurn, String>>,
+    },
     /// Runs a task on the worker. Shutting down waits for it (briefly), so a task can still
     /// publish a last event once its owner has gone.
     Spawn(Box<dyn FnOnce(TaskContext) -> TaskFuture + Send>),
     /// Stops the worker: the last handle has gone.
     Shutdown,
+}
+
+/// A TURN server ready to use: its address looked up, with credentials.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedTurn {
+    /// The server's address (IPv4 if it has one: joiners mostly are).
+    pub(crate) server: SocketAddr,
+    /// The username.
+    pub(crate) username: String,
+    /// The password.
+    pub(crate) password: String,
+}
+
+/// Gets the credentials for `config` and looks the server up.
+async fn resolve_turn(config: TurnConfig) -> Result<ResolvedTurn, String> {
+    let server = match config {
+        TurnConfig::Static(s) => s,
+        TurnConfig::Provider(provider) => tokio::time::timeout(Duration::from_secs(15), provider())
+            .await
+            .map_err(|_| "the TURN credential provider timed out".to_string())??,
+    };
+    let host_port = server.host_port();
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host(host_port.as_str()),
+    )
+    .await
+    .map_err(|_| format!("looking up {host_port} timed out"))?
+    .map_err(|e| format!("cannot find the TURN server {host_port}: {e}"))?
+    .collect();
+    let addr = addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or(addrs.first())
+        .ok_or_else(|| format!("{host_port} has no address"))?;
+    Ok(ResolvedTurn {
+        server: *addr,
+        username: server.username,
+        password: server.password,
+    })
 }
 
 /// A task run on the worker.
@@ -307,6 +356,11 @@ async fn run(
                 }
                 Some(Command::MapPort { port, events, stop }) => {
                     port_maps.spawn(portmap::run(port, events, stop));
+                }
+                Some(Command::ResolveTurn { config, reply }) => {
+                    tasks.spawn(async move {
+                        let _ = reply.send(resolve_turn(config).await);
+                    });
                 }
                 Some(Command::Spawn(task)) => {
                     tasks.spawn(task(TaskContext {

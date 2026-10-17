@@ -23,6 +23,10 @@ pub(crate) struct IceParams {
     pub(crate) pwd: String,
     /// The candidates, as SDP `candidate:` lines.
     pub(crate) candidates: Vec<String>,
+    /// The sender's router, in [`NatSummary`](crate::NatSummary)'s compact form (absent from
+    /// older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) nat: Option<String>,
 }
 
 /// What the handshake's events carry, as JSON, encrypted.
@@ -50,6 +54,15 @@ pub(crate) enum Message {
         attempt: String,
         /// The host's side of the checks.
         ice: IceParams,
+    },
+    /// Joiner to host, after the checks failed: no path worked. The host learns that players
+    /// cannot reach it, which it could not tell from a joiner whose checks never arrived.
+    Unreachable {
+        /// The request's attempt.
+        attempt: String,
+        /// The joiner's router, in [`NatSummary`](crate::NatSummary)'s compact form.
+        #[serde(default)]
+        nat: Option<String>,
     },
     /// Host to joiner: not joinable.
     Refuse {

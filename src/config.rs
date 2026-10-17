@@ -1,7 +1,9 @@
 //! What a game tells the library: who it is, and which public services to use.
 
 use std::fmt;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +28,123 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 
 /// Decides whether a game of version `theirs` can play with this game, of version `ours`.
 pub type CompatibilityFn = dyn Fn(&str, &str) -> bool + Send + Sync;
+
+/// A TURN server and a long-term credential for it (RFC 8656), as a TURN provider gives them.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TurnServer {
+    /// The server, as `host:port` (UDP), e.g. `"relay.example.com:3478"`. A `turn:` prefix
+    /// and a `?transport=udp` suffix, as in WebRTC's `iceServers`, are accepted.
+    pub address: String,
+    /// The username.
+    pub username: String,
+    /// The password.
+    pub password: String,
+}
+
+impl TurnServer {
+    /// A server at `address` with a username and password.
+    #[must_use]
+    pub fn new(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> TurnServer {
+        TurnServer {
+            address: address.into(),
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// The `host:port` to look up, without a `turn:` prefix or a query.
+    pub(crate) fn host_port(&self) -> String {
+        let a = self.address.trim();
+        let a = a.strip_prefix("turn:").unwrap_or(a);
+        let a = a.split('?').next().unwrap_or(a);
+        let has_port = a.parse::<std::net::SocketAddr>().is_ok()
+            || (a.matches(':').count() == 1
+                && a.rsplit_once(':')
+                    .is_some_and(|(_, p)| p.parse::<u16>().is_ok()));
+        if has_port {
+            a.to_string()
+        } else if a.contains(':') && !a.starts_with('[') {
+            // A bare IPv6 address.
+            format!("[{a}]:3478")
+        } else {
+            format!("{a}:3478")
+        }
+    }
+}
+
+impl fmt::Debug for TurnServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnServer")
+            .field("address", &self.address)
+            .field("username", &self.username)
+            // The password stays out of logs.
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a credential provider returns: a server and short-lived credentials, or why not.
+pub type TurnCredentialFuture = Pin<Box<dyn Future<Output = Result<TurnServer, String>> + Send>>;
+
+/// Makes short-lived TURN credentials, e.g. by calling a TURN provider's REST API. It runs on
+/// the library's background thread (a Tokio runtime), when hosting starts and again whenever
+/// the server stops taking the last credentials.
+/// [`RelayProvider::config`](crate::RelayProvider::config) makes one for providers with an API.
+pub type TurnCredentialFn = dyn Fn() -> TurnCredentialFuture + Send + Sync;
+
+/// A host's TURN relay: lets players whose routers defeat hole punching connect through a
+/// relay server, at the cost of a detour. Only the host needs one, and only the host's
+/// credentials are used: joiners send to the relayed address like to any other.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum TurnConfig {
+    /// A fixed server and long-term credential.
+    Static(TurnServer),
+    /// Credentials made when needed (see [`TurnCredentialFn`]).
+    Provider(Arc<TurnCredentialFn>),
+}
+
+impl TurnConfig {
+    /// A fixed server and credential.
+    #[must_use]
+    pub fn new(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> TurnConfig {
+        TurnConfig::Static(TurnServer::new(address, username, password))
+    }
+
+    /// Credentials from `provider`, e.g. a call to a TURN provider's REST API:
+    ///
+    /// ```
+    /// use game_rendezvous::{TurnConfig, TurnServer};
+    ///
+    /// let turn = TurnConfig::provider(|| {
+    ///     Box::pin(async {
+    ///         // ... ask the provider for credentials ...
+    ///         Ok(TurnServer::new("relay.example.com:3478", "1700000000:ann", "secret"))
+    ///     })
+    /// });
+    /// ```
+    #[must_use]
+    pub fn provider(provider: impl Fn() -> TurnCredentialFuture + Send + Sync + 'static) -> Self {
+        TurnConfig::Provider(Arc::new(provider))
+    }
+}
+
+impl fmt::Debug for TurnConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TurnConfig::Static(s) => f.debug_tuple("Static").field(s).finish(),
+            TurnConfig::Provider(_) => f.write_str("Provider(..)"),
+        }
+    }
+}
 
 /// The library's configuration. [`Config::new`] gives the defaults for public play; change
 /// fields after that for tests and special setups.
@@ -56,6 +175,10 @@ pub struct Config {
     pub relays: Vec<String>,
     /// STUN servers, as `host:port`.
     pub stun_servers: Vec<String>,
+    /// TURN relays for hosting, for players who cannot connect otherwise; none by default. The
+    /// first that works is used. See [`DEFAULT_RELAY_PROVIDERS`](crate::DEFAULT_RELAY_PROVIDERS)
+    /// for providers a player can sign up with.
+    pub turn: Vec<TurnConfig>,
     /// Whether a host asks its router to open its port (UPnP IGD, NAT-PMP, PCP). Without the
     /// `port-mapping` feature, a host only reports
     /// [`PortMapEvent::Failed`](crate::PortMapEvent::Failed).
@@ -77,6 +200,8 @@ pub struct Config {
     /// How long a joiner waits for the host's answer to its join request.
     pub handshake_timeout: Duration,
     /// How long connectivity checks may take once both sides know each other's addresses.
+    /// When one side's router hands out random ports and the other's does not, punching
+    /// through it may take up to 10 seconds more after the first 4.
     pub connect_timeout: Duration,
     /// How many handshake messages a host (or joiner) decrypts per second, on the worker
     /// thread. Anyone can send a host handshake messages; beyond this many a second they are
@@ -98,6 +223,7 @@ impl Config {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            turn: Vec::new(),
             port_mapping: true,
             local_addresses: None,
             compatible: Arc::new(|ours, theirs| ours == theirs),
@@ -127,6 +253,13 @@ impl Config {
         self
     }
 
+    /// Hosts with this TURN relay too, tried after those already given.
+    #[must_use]
+    pub fn with_turn(mut self, turn: TurnConfig) -> Self {
+        self.turn.push(turn);
+        self
+    }
+
     /// Decides version compatibility with `f(ours, theirs)` instead of exact equality. Both the
     /// joiner and the host apply their own rule; either can refuse.
     #[must_use]
@@ -152,6 +285,7 @@ impl fmt::Debug for Config {
             .field("game_version", &self.game_version)
             .field("relays", &self.relays)
             .field("stun_servers", &self.stun_servers)
+            .field("turn", &self.turn)
             .field("port_mapping", &self.port_mapping)
             .field("local_addresses", &self.local_addresses)
             .field("listing_ttl", &self.listing_ttl)
@@ -162,5 +296,27 @@ impl fmt::Debug for Config {
             .field("handshake_rate", &self.handshake_rate)
             // `compatible` is a function.
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_addresses_take_the_usual_forms() {
+        let host_port = |a: &str| TurnServer::new(a, "u", "p").host_port();
+        assert_eq!(
+            host_port("relay.example.com:3478"),
+            "relay.example.com:3478"
+        );
+        assert_eq!(
+            host_port("turn:relay.example.com:80?transport=udp"),
+            "relay.example.com:80"
+        );
+        assert_eq!(host_port(" relay.example.com "), "relay.example.com:3478");
+        assert_eq!(host_port("[2001:db8::1]:3479"), "[2001:db8::1]:3479");
+        assert_eq!(host_port("2001:db8::1"), "[2001:db8::1]:3478");
+        assert!(!format!("{:?}", TurnServer::new("a:1", "u", "hunter2")).contains("hunter2"));
     }
 }

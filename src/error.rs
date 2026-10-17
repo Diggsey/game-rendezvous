@@ -4,6 +4,7 @@ use std::fmt;
 use std::io;
 
 use crate::handshake::RefuseReason;
+use crate::nat::NatSummary;
 
 /// Why joining a game failed. `Display` gives a message fit to show the player.
 #[derive(Debug)]
@@ -24,13 +25,18 @@ pub enum JoinError {
     RelaysUnavailable(String),
     /// The host never answered the join request.
     HostNotResponding,
-    /// Both sides knew each other's addresses, but no path between them worked.
+    /// Both sides knew each other's addresses, but no path between them worked. The host was
+    /// told, so it can suggest a relay to its player.
     NoRoute {
         /// The host's addresses that were tried.
         tried: usize,
-        /// This side's router maps every destination to a different port, which defeats hole
-        /// punching unless the host's port is open.
-        symmetric_nat: bool,
+        /// Both routers give each destination a port of its own: only a TURN relay on the
+        /// host's side can connect the two.
+        needs_relay: bool,
+        /// This side's router.
+        ours: Option<NatSummary>,
+        /// The host's router, as it said.
+        host: Option<NatSummary>,
     },
     /// The socket failed.
     Io(io::Error),
@@ -62,18 +68,20 @@ impl fmt::Display for JoinError {
                 write!(f, "the host did not answer; the game may have closed")
             }
             JoinError::NoRoute {
-                tried,
-                symmetric_nat,
+                tried, needs_relay, ..
             } => {
-                write!(
-                    f,
-                    "no network path to the host worked ({tried} tried); the host can turn on \
-                     UPnP or forward their UDP port"
-                )?;
-                if *symmetric_nat {
-                    write!(f, " (your router's symmetric NAT blocks hole punching)")?;
+                write!(f, "no network path to the host worked ({tried} tried); ")?;
+                if *needs_relay {
+                    write!(
+                        f,
+                        "both routers block hole punching, so the host needs to set up a relay"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "the host can set up a relay, turn on UPnP or forward their UDP port"
+                    )
                 }
-                Ok(())
             }
             JoinError::Io(e) => write!(f, "network error: {e}"),
         }
@@ -111,12 +119,14 @@ mod tests {
     fn no_route_message_reads_as_one_line() {
         let e = JoinError::NoRoute {
             tried: 3,
-            symmetric_nat: true,
+            needs_relay: true,
+            ours: None,
+            host: None,
         };
         assert_eq!(
             e.to_string(),
-            "no network path to the host worked (3 tried); the host can turn on UPnP or forward \
-             their UDP port (your router's symmetric NAT blocks hole punching)"
+            "no network path to the host worked (3 tried); both routers block hole punching, so \
+             the host needs to set up a relay"
         );
     }
 }

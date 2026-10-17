@@ -2,7 +2,7 @@
 //!
 //! It publishes and refreshes the listing (and its tombstone at the end), reads join requests,
 //! refuses the ones the host would refuse, answers repeats, and passes the game thread only the
-//! requests it accepted, decrypted. Decrypting is capped per second ([`RateBudget`]), so a
+//! requests it accepted, decrypted, and joiners' word that they could not reach the host. Decrypting is capped per second ([`RateBudget`]), so a
 //! flood of requests costs bounded work here and none on the game thread.
 
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::Config;
 use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
 use crate::listing::{Listing, MAX_NAME, MAX_VERSION, PROTOCOL, clean, listing_event};
+use crate::nat::NatSummary;
 use crate::worker::{Inbox, Published, Sink, TaskContext};
 
 /// Joiners being connected at once; more are told to wait.
@@ -35,6 +36,8 @@ const FORGET_FINISHED: Duration = Duration::from_secs(600);
 pub(super) enum ToTask {
     /// The listing changed.
     SetListing(Listing),
+    /// The host's router summary changed (it goes in the listing).
+    SetNat(Option<NatSummary>),
     /// Accept a joiner the task passed on, with the host's side of the checks.
     Accept {
         /// The joiner's key.
@@ -64,6 +67,13 @@ pub(super) struct JoinRequest {
 pub(super) enum FromTask {
     /// A request to connect: the game runs the checks and answers with [`ToTask::Accept`].
     Request(JoinRequest),
+    /// A joiner said it could not reach the host.
+    Unreachable {
+        /// The joiner's key for the attempt.
+        from: PublicKey,
+        /// The joiner's router, as it said.
+        nat: Option<NatSummary>,
+    },
     /// A player the task refused (already answered).
     Refused {
         /// The player's name, cleaned.
@@ -76,6 +86,8 @@ pub(super) enum FromTask {
 /// A joiner between its request and the game being done with it. Each join attempt signs with
 /// a key of its own, so the key identifies the attempt.
 struct Active {
+    /// The attempt, as the request named it.
+    attempt: String,
     /// The accept, once the game has made it: sent again if the joiner repeats its request.
     accept: Option<Message>,
     /// When the accept last went out.
@@ -100,6 +112,8 @@ pub(super) struct HostTask {
     pub(super) notices: Sink<FromTask>,
     /// How the relays took each copy of the listing, to the game thread.
     pub(super) published: Sink<Published>,
+    /// The host's router, for the listing.
+    pub(super) nat: Option<NatSummary>,
 }
 
 impl HostTask {
@@ -131,6 +145,7 @@ impl HostTask {
                 &self.config,
                 &self.keys,
                 &self.listing,
+                self.nat,
                 true,
                 state.last_created,
             )
@@ -146,6 +161,10 @@ impl HostTask {
                 self.listing = l;
                 state.listing_changed = true;
             }
+            ToTask::SetNat(nat) => {
+                self.nat = nat;
+                state.listing_changed = true;
+            }
             ToTask::Accept { to, attempt, ice } => {
                 let Some(active) = state.active.get_mut(&to) else {
                     return;
@@ -156,10 +175,10 @@ impl HostTask {
                 active.last_sent = Some(Instant::now());
             }
             ToTask::JoinerDone(key) => {
-                state.active.remove(&key);
+                let attempt = state.active.remove(&key).map(|a| a.attempt);
                 let now = Instant::now();
-                state.finished.retain(|_, t| now - *t < FORGET_FINISHED);
-                state.finished.insert(key, now);
+                state.finished.retain(|_, f| now - f.at < FORGET_FINISHED);
+                state.finished.insert(key, Finished { at: now, attempt });
             }
         }
     }
@@ -171,8 +190,14 @@ impl HostTask {
         // tight loop.
         state.last_publish = Some(Instant::now());
         state.listing_changed = false;
-        if let Some(event) = listing_event(&self.config, &self.keys, &self.listing, false, previous)
-        {
+        if let Some(event) = listing_event(
+            &self.config,
+            &self.keys,
+            &self.listing,
+            self.nat,
+            false,
+            previous,
+        ) {
             state.last_created = Some(event.created_at);
             self.ctx
                 .publish_in_background(event, Some(self.published.clone()));
@@ -181,24 +206,10 @@ impl HostTask {
         }
     }
 
-    /// Reads a handshake event: a join request, or one repeated.
+    /// Reads a handshake event: a join request, one repeated, or a joiner's word that it
+    /// could not connect.
     fn request(&mut self, state: &mut State, event: &Event) {
-        let from = event.pubkey;
-        // A joiner repeating its request (each attempt has its own key): answer again, unread.
-        if let Some(active) = state.active.get_mut(&from) {
-            let now = Instant::now();
-            if let Some(accept) = &active.accept
-                && active
-                    .last_sent
-                    .is_none_or(|t| now - t >= RESEND_MIN_INTERVAL)
-                && self.ctx.send_sealed(&self.keys, &from, accept, None)
-            {
-                active.last_sent = Some(now);
-            }
-            return;
-        }
-        if state.finished.contains_key(&from) {
-            debug!("ignoring a request from a joiner already done with");
+        if self.known_joiner(state, event) {
             return;
         }
         if event.created_at + FORGET_FINISHED.as_secs() < Timestamp::now() {
@@ -247,7 +258,8 @@ impl HostTask {
                 attempt,
                 reason: reason.clone(),
             };
-            self.ctx.send_sealed(&self.keys, &from, &refuse, None);
+            self.ctx
+                .send_sealed(&self.keys, &event.pubkey, &refuse, None);
             let _ = self.notices.send(FromTask::Refused {
                 name: player_name,
                 reason,
@@ -255,19 +267,78 @@ impl HostTask {
             return;
         }
         state.active.insert(
-            from,
+            event.pubkey,
             Active {
+                attempt: attempt.clone(),
                 accept: None,
                 last_sent: None,
             },
         );
         let _ = self.notices.send(FromTask::Request(JoinRequest {
-            from,
+            from: event.pubkey,
             attempt,
             player_name,
             ice,
         }));
     }
+
+    /// Reads `event` if it is from a joiner already known: one repeating its request (each
+    /// attempt has its own key), or saying it could not connect. Only the joiner can sign as
+    /// its key, and the budget bounds the reading. Returns whether it was.
+    fn known_joiner(&mut self, state: &mut State, event: &Event) -> bool {
+        let from = event.pubkey;
+        if let Some(active) = state.active.get_mut(&from) {
+            let now = Instant::now();
+            if active.accept.is_none() || !state.budget.take() {
+                return true;
+            }
+            match handshake::open(&self.keys, event) {
+                Some(Message::Unreachable { attempt, nat }) if attempt == active.attempt => {
+                    let nat = crate::nat::parse_summary(nat.as_deref());
+                    let _ = self.notices.send(FromTask::Unreachable { from, nat });
+                }
+                Some(Message::Request { .. }) => {
+                    if let Some(accept) = &active.accept
+                        && active
+                            .last_sent
+                            .is_none_or(|t| now - t >= RESEND_MIN_INTERVAL)
+                        && self.ctx.send_sealed(&self.keys, &from, accept, None)
+                    {
+                        active.last_sent = Some(now);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if let Some(finished) = state.finished.get_mut(&from) {
+            // The game gave up on the joiner (it may never have heard from it); the joiner may
+            // still say why, once.
+            if let Some(expected) = finished.attempt.take()
+                && state.budget.take()
+            {
+                match handshake::open(&self.keys, event) {
+                    Some(Message::Unreachable { attempt, nat }) if attempt == expected => {
+                        let nat = crate::nat::parse_summary(nat.as_deref());
+                        let _ = self.notices.send(FromTask::Unreachable { from, nat });
+                    }
+                    _ => finished.attempt = Some(expected),
+                }
+            } else {
+                debug!("ignoring a message from a joiner already done with");
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// A joiner the game is done with.
+struct Finished {
+    /// When.
+    at: Instant,
+    /// Its attempt, until it says it could not connect (or it is forgotten).
+    attempt: Option<String>,
 }
 
 /// What the task keeps track of.
@@ -280,8 +351,8 @@ struct State {
     last_created: Option<Timestamp>,
     /// Joiners between their request and the game being done with them.
     active: HashMap<PublicKey, Active>,
-    /// Joiners the game is done with, and when.
-    finished: HashMap<PublicKey, Instant>,
+    /// Joiners the game is done with.
+    finished: HashMap<PublicKey, Finished>,
     /// Handshake messages decrypted a second.
     budget: RateBudget,
     /// Refusals published a second.

@@ -17,6 +17,15 @@ publish = false
 [dependencies]
 # NAT-PMP and PCP port mapping.
 crab_nat = { version = "0.8", optional = true }
+# TURN and hole-punching messages: FINGERPRINT, MESSAGE-INTEGRITY and long-term credential keys.
+crc = "3"
+hmac = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
+# Fetching TURN credentials from a provider's API over HTTPS (the Nostr client brings these in).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 # UPnP IGD port mapping.
 igd-next = { version = "0.18", features = ["aio_tokio"], optional = true }
 # str0m's sans-IO ICE agent: connectivity checks over a socket we own.
@@ -30,14 +39,17 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tracing = "0.1"
 
 [features]
-default = ["port-mapping"]
+default = ["port-mapping", "relay-api"]
 # Ask a host's router to forward its port (UPnP IGD, NAT-PMP, PCP). Without it,
 # `Config::port_mapping` only reports that no port was mapped.
 port-mapping = ["dep:crab_nat", "dep:igd-next"]
+# Fetch TURN credentials from a relay provider's API (see `RelayCredentials::Api`). Without it,
+# such providers' `RelayProvider::config` fails; a username and password still work.
+relay-api = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 nostr-sdk = { version = "0.45", features = ["local-relay"] }

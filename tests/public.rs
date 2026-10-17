@@ -49,10 +49,15 @@ fn public_relays_list_and_join() {
     let status = host.host.status();
     println!(
         "listed on {listed} relays; relays connected {:?}; public addresses {:?}",
-        status.relays, status.public_addresses
+        status.relays, status.nat.public_addresses
+    );
+    println!(
+        "network: {:?} ({:?})",
+        status.nat,
+        status.nat.reachability()
     );
     assert!(
-        !status.public_addresses.is_empty(),
+        !status.nat.public_addresses.is_empty(),
         "no STUN server answered"
     );
 

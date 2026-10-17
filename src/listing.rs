@@ -17,6 +17,7 @@ use nostr_sdk::prelude::{
 use serde::{Deserialize, Serialize};
 
 use crate::Config;
+use crate::nat::NatSummary;
 
 /// NIP-78: addressable "arbitrary custom app data".
 pub(crate) const LISTING_KIND: Kind = Kind::Custom(30078);
@@ -116,6 +117,10 @@ pub struct GameInfo {
     pub updated: SystemTime,
     /// When the listing expires unless refreshed (the host's clock).
     pub expires: SystemTime,
+    /// The host's router, as the host found it (`None` from older versions, or before the
+    /// host knew). [`Browser::outlook`](crate::Browser::outlook) judges from it whether this
+    /// player can probably connect.
+    pub nat: Option<NatSummary>,
 }
 
 /// A listing's event content.
@@ -140,6 +145,9 @@ struct Content {
     /// A tombstone: the game has closed.
     #[serde(default)]
     closed: bool,
+    /// The host's router, in [`NatSummary`]'s compact form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nat: Option<String>,
 }
 
 /// `true`, for serde's defaults.
@@ -152,7 +160,8 @@ pub(crate) fn listing_tag(game_id: &str) -> String {
     format!("game-rendezvous/{game_id}")
 }
 
-/// A listing event, signed by the game's `keys`, live for `config.listing_ttl`.
+/// A listing event, signed by the game's `keys`, live for `config.listing_ttl`, with the
+/// host's router summary `nat`.
 ///
 /// Relays keep the newest copy by `created_at`, in whole seconds, and of two from the same
 /// second the one with the lower id, so each copy must be dated after the last (`previous`).
@@ -160,6 +169,7 @@ pub(crate) fn listing_event(
     config: &Config,
     keys: &Keys,
     listing: &Listing,
+    nat: Option<NatSummary>,
     closed: bool,
     previous: Option<Timestamp>,
 ) -> Option<Event> {
@@ -172,6 +182,7 @@ pub(crate) fn listing_event(
         joinable: listing.joinable,
         metadata: listing.metadata.clone(),
         closed,
+        nat: nat.map(|n| n.to_string()),
     };
     // A tombstone only has to outlive the browsers' copies of the listing it replaces.
     let ttl = config.listing_ttl.max(Duration::from_secs(5));
@@ -250,6 +261,7 @@ pub(crate) fn parse_listing(config: &Config, event: &Event) -> Option<Parsed> {
         metadata,
         updated: to_system_time(event.created_at),
         expires,
+        nat: crate::nat::parse_summary(content.nat.as_deref()),
     }))
 }
 
@@ -293,7 +305,15 @@ mod tests {
         };
         listing.metadata.insert("mode".into(), "ctf".into());
         let keys = Keys::generate();
-        let event = listing_event(&config, &keys, &listing, false, None).unwrap();
+        let event = listing_event(
+            &config,
+            &keys,
+            &listing,
+            Some("eim;6".parse().unwrap()),
+            false,
+            None,
+        )
+        .unwrap();
         let game = open(parse_listing(&config, &event));
         assert_eq!(game.id, GameId(keys.public_key()));
         assert_eq!(
@@ -303,8 +323,10 @@ mod tests {
         assert_eq!((game.players, game.max_players), (2, 4));
         assert!(game.compatible && game.joinable);
         assert_eq!(game.metadata, listing.metadata);
+        assert_eq!(game.nat, Some("eim;6".parse().unwrap()));
 
-        let closed = listing_event(&config, &keys, &listing, true, Some(event.created_at)).unwrap();
+        let closed =
+            listing_event(&config, &keys, &listing, None, true, Some(event.created_at)).unwrap();
         assert!(closed.created_at > event.created_at);
         assert!(matches!(
             parse_listing(&config, &closed),

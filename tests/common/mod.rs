@@ -6,7 +6,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use game_rendezvous::{Config, Host, HostEvent, Listing, Rendezvous, bind_dual_stack};
+use game_rendezvous::{Config, GameSocket, Host, HostEvent, Listing, Rendezvous};
 use nostr_sdk::prelude::{
     Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, LocalRelay, PublicKey,
     RateLimit, Tag, nip44,
@@ -168,10 +168,10 @@ pub fn wait_for<T>(timeout: Duration, what: &str, mut f: impl FnMut() -> Option<
     }
 }
 
-/// A host as a game runs it: its socket, read every frame, with the library's datagrams
-/// passed on.
+/// A host as a game runs it: its socket, read every frame (which passes the library's
+/// datagrams on).
 pub struct HostGame {
-    pub socket: UdpSocket,
+    pub socket: GameSocket,
     pub host: Host,
     pub events: Vec<HostEvent>,
     /// The game's own datagrams.
@@ -182,7 +182,7 @@ pub struct HostGame {
 
 impl HostGame {
     pub fn new(rv: &Rendezvous, listing: Listing) -> HostGame {
-        let socket = bind_dual_stack(0).unwrap();
+        let socket = GameSocket::bind(0).unwrap();
         let host = rv.host(&socket, listing).unwrap();
         HostGame {
             socket,
@@ -198,13 +198,7 @@ impl HostGame {
         let mut buf = [0u8; 1500];
         while self.pump_socket {
             match self.socket.recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    let from = game_rendezvous::canonical(from);
-                    if !self.host.handle_datagram(from, &buf[..n]) {
-                        self.received.push((from, buf[..n].to_vec()));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Ok((n, from)) => self.received.push((from, buf[..n].to_vec())),
                 Err(_) => break,
             }
         }
@@ -215,6 +209,14 @@ impl HostGame {
 
     pub fn port(&self) -> u16 {
         self.socket.local_addr().unwrap().port()
+    }
+
+    /// The first `PeerConnected`, as its address and name.
+    pub fn connected(&self) -> Option<(SocketAddr, String)> {
+        self.events.iter().find_map(|e| match e {
+            HostEvent::PeerConnected { addr, name, .. } => Some((*addr, name.clone())),
+            _ => None,
+        })
     }
 }
 

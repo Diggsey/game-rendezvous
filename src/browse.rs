@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use nostr_sdk::prelude::{Event, Filter, SubscriptionId, Timestamp};
 
+use crate::check::SelfCheck;
 use crate::listing::{GameId, GameInfo, LISTING_KIND, Parsed, listing_tag, parse_listing};
+use crate::nat::{NatSummary, Outlook};
 use crate::worker::{Command, Inbox};
 use crate::{Inner, RelayCount};
 
@@ -31,6 +33,8 @@ pub struct Browser {
     events: Inbox<Event>,
     /// The games heard of.
     games: Games,
+    /// A look at this player's own router, for [`outlook`](Self::outlook).
+    self_check: Option<SelfCheck>,
 }
 
 impl Browser {
@@ -42,11 +46,13 @@ impl Browser {
             .since(Timestamp::now() - LOOKBACK.as_secs())
             .limit(500);
         let (subscription, events) = inner.worker.subscribe(filter);
+        let self_check = SelfCheck::new(&inner);
         Browser {
             inner,
             subscription,
             events,
             games: Games::default(),
+            self_check,
         }
     }
 
@@ -65,7 +71,30 @@ impl Browser {
         if changed {
             self.games.sort();
         }
+        if let Some(c) = &mut self.self_check {
+            let known = c.summary.is_some();
+            c.poll(&self.inner);
+            // Outlooks change once the router is known.
+            changed |= !known && c.summary.is_some() && !self.games.sorted.is_empty();
+        }
         changed
+    }
+
+    /// This player's router, once a look at it (from a socket of the browser's own, as a
+    /// join's would be) is done: a second or two after browsing starts.
+    #[must_use]
+    pub fn nat(&self) -> Option<NatSummary> {
+        self.self_check.as_ref().and_then(|c| c.summary)
+    }
+
+    /// Whether this player can probably connect to `game`, from both routers: for marking
+    /// games in the list. [`Outlook::Unknown`] until both are known.
+    #[must_use]
+    pub fn outlook(&self, game: &GameInfo) -> Outlook {
+        match (self.nat(), game.nat) {
+            (Some(me), Some(host)) => me.outlook(&host),
+            _ => Outlook::Unknown,
+        }
     }
 
     /// The games found: joinable ones first, then ones not taking players, then other versions.
@@ -182,6 +211,7 @@ mod tests {
             metadata: BTreeMap::new(),
             updated: SystemTime::now(),
             expires: SystemTime::now() + Duration::from_secs(60),
+            nat: None,
         }
     }
 

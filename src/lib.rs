@@ -9,35 +9,36 @@
 //! - **Handshake.** A joiner and the host swap their address candidates through the relays,
 //!   encrypted to each other ([NIP-44]), in ephemeral events that relays do not store.
 //! - **Connection.** Candidates come from the machine's LAN and IPv6 addresses, public STUN
-//!   servers (asked from the game's own socket), and a port the host's router was asked to open
-//!   (UPnP, NAT-PMP or PCP). Both sides then run ICE connectivity checks over the game's socket,
-//!   punching through NATs, and the best working path wins ([`Rendezvous::join`]).
+//!   servers (asked from the game's own socket), a port the host's router was asked to open
+//!   (UPnP, NAT-PMP or PCP), ports predicted for routers that hand them out in sequence, and
+//!   the host's TURN relay, if it has one. Both sides then run ICE connectivity checks over the
+//!   game's socket, punching through NATs, and the best working path wins
+//!   ([`Rendezvous::join`]). When one side's router hands out random ports and the other's
+//!   does not, the strict side opens 256 more sockets and the other probes random ports until
+//!   one pair meets (the birthday paradox makes that likely within seconds).
 //!
 //! The result is a plain non-blocking [`UdpSocket`] and the peer's address: the game keeps its
 //! own protocol.
 //!
 //! # Hosting
 //!
-//! The host keeps its own socket and passes the library the datagrams that are its
-//! ([`Host::handle_datagram`]): STUN, which a game's own packets must never look like
-//! ([`is_stun`]).
+//! The host plays on a [`GameSocket`], which it shares with the library: the game sends and
+//! receives through it, and it keeps the library's datagrams (STUN, which a game's own
+//! packets must never look like: [`is_stun`]) for the host. Players connected through the
+//! relay, or through one of the extra sockets, look like any other.
 //!
 //! ```no_run
-//! use game_rendezvous::{Config, HostEvent, Listing, Rendezvous, bind_dual_stack, canonical};
+//! use game_rendezvous::{Config, GameSocket, HostEvent, Listing, Rendezvous};
 //!
 //! let rv = Rendezvous::new(Config::new("my-game", "1.2.0"))?;
-//! let socket = bind_dual_stack(7777)?;
+//! let socket = GameSocket::bind(7777)?;
 //! let listing = Listing { name: "Ann's game".into(), max_players: 4, ..Default::default() };
 //! let mut host = rv.host(&socket, listing)?;
 //! let mut buf = [0u8; 65_536];
 //! loop {
 //!     // Every frame: the socket first...
 //!     while let Ok((n, from)) = socket.recv_from(&mut buf) {
-//!         // One address per peer, however the dual-stack socket saw it.
-//!         let from = canonical(from);
-//!         if !host.handle_datagram(from, &buf[..n]) {
-//!             // ... the game's own packet, from `from`
-//!         }
+//!         // ... the game's own packet, from `from`
 //!     }
 //!     // ...then what happened.
 //!     while let Some(event) = host.poll() {
@@ -49,6 +50,21 @@
 //! }
 //! # Ok::<(), std::io::Error>(())
 //! ```
+//!
+//! # Whether players can reach a host, and relays
+//!
+//! Some routers defeat every way through: when both players' routers hand out a random port
+//! for each destination, or a mobile carrier's NAT sits in front. A game can find out before
+//! hosting ([`Rendezvous::check_nat`], whose [`NatReport::reachability`] says whether to
+//! suggest a relay), while hosting ([`HostEvent::Network`], [`HostStatus::failed_joins`]),
+//! and in the game list ([`Browser::outlook`]). Joiners who could not connect tell the host
+//! ([`JoinFailure::Unreachable`]).
+//!
+//! A TURN relay ([`Config::turn`]) gets every player in, through a detour. Only the host needs
+//! one; joiners need no account. [`DEFAULT_RELAY_PROVIDERS`] lists providers with a free tier,
+//! each with where to sign up and what to enter, for a game's relay settings
+//! ([`RelayProvider::config`] turns what the player entered into a [`TurnConfig`]). The library
+//! never asks the player anything itself: the game decides when to suggest a relay.
 //!
 //! # Joining
 //!
@@ -105,6 +121,8 @@
 //!
 //! - `port-mapping` (on by default): asks the host's router to forward its port, with UPnP IGD,
 //!   NAT-PMP or PCP. Without it, [`Config::port_mapping`] has no effect.
+//! - `relay-api` (on by default): fetches TURN credentials from a relay provider's API
+//!   ([`RelayCredentials::Api`]), over HTTPS. Without it, only a username and password work.
 //!
 //! # Testing without the public relays
 //!
@@ -124,16 +142,29 @@
 #![warn(rustdoc::missing_crate_level_docs, rustdoc::bare_urls)]
 
 mod browse;
+mod check;
 mod config;
 mod error;
+#[cfg(feature = "relay-api")]
+mod fetch;
 mod handshake;
 mod host;
 mod ice;
 mod join;
 mod listing;
+mod nat;
 mod net;
 mod portmap;
+mod providers;
+mod punch;
+#[cfg(test)]
+mod sim;
+mod socket;
 pub mod stun;
+mod survey;
+mod traverse;
+mod turn;
+mod wire;
 mod worker;
 
 use std::io;
@@ -141,14 +172,24 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 
 pub use browse::Browser;
-pub use config::{CompatibilityFn, Config, DEFAULT_RELAYS, DEFAULT_STUN_SERVERS};
+pub use check::NatCheck;
+pub use config::{
+    CompatibilityFn, Config, DEFAULT_RELAYS, DEFAULT_STUN_SERVERS, TurnConfig, TurnCredentialFn,
+    TurnCredentialFuture, TurnServer,
+};
 pub use error::JoinError;
 pub use handshake::RefuseReason;
-pub use host::{Host, HostEvent, HostStatus};
+pub use host::{Host, HostEvent, HostStatus, JoinFailure, PeerPath};
 pub use join::{Connection, Join, JoinStage};
 pub use listing::{GameId, GameInfo, Listing};
+pub use nat::{NatMapping, NatReport, NatSummary, Outlook, PortAllocation, Reachability};
 pub use net::{bind_dual_stack, canonical, for_socket, send_to};
 pub use portmap::{PortMapEvent, PortMapMethod};
+pub use providers::{
+    CUSTOM_RELAY, CredentialApi, DEFAULT_RELAY_PROVIDERS, HttpMethod, RelayCredentials, RelayField,
+    RelayProvider, relay_provider,
+};
+pub use socket::GameSocket;
 pub use stun::is_stun;
 
 use worker::Worker;
@@ -161,6 +202,8 @@ const _: () = {
     check::<Host>();
     check::<Browser>();
     check::<Join>();
+    check::<GameSocket>();
+    check::<NatCheck>();
 };
 
 /// How many of the configured relays are connected, from [`Rendezvous::relays`] and the
@@ -236,16 +279,27 @@ impl Rendezvous {
         Browser::new(self.inner.clone())
     }
 
-    /// Advertises a game played on `socket`, which the game keeps using (the host sends from a
-    /// clone of it). The game must pass its datagrams to [`Host::handle_datagram`].
+    /// Advertises a game played on `socket`. The game keeps sending and receiving through it
+    /// (see [`GameSocket`]); the host takes the library's datagrams from it.
     ///
-    /// A socket from [`bind_dual_stack`] also lets IPv6 players in.
+    /// A dual-stack socket ([`GameSocket::bind`]) also lets IPv6 players in.
     ///
     /// # Errors
     ///
-    /// If the socket cannot be cloned or has no local address.
-    pub fn host(&self, socket: &UdpSocket, listing: Listing) -> io::Result<Host> {
+    /// If the socket has no local address, or another host is attached to it.
+    pub fn host(&self, socket: &GameSocket, listing: Listing) -> io::Result<Host> {
         Host::new(self.inner.clone(), socket, listing)
+    }
+
+    /// Checks this machine's network as a host would see it, on a socket of its own: whether
+    /// players could probably reach a game hosted here, before hosting one (see
+    /// [`NatReport::reachability`]). It also tests the configured TURN relay.
+    ///
+    /// # Errors
+    ///
+    /// If no socket can be bound.
+    pub fn check_nat(&self) -> io::Result<NatCheck> {
+        NatCheck::new(self.inner.clone())
     }
 
     /// Joins `game` on a new dual-stack socket.

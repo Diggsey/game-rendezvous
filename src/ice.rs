@@ -5,8 +5,15 @@
 //! checks open both NATs' pinholes ("hole punching"); the joiner, controlling, nominates the
 //! best pair that worked. The game's own socket carries the checks, so the pinholes are the
 //! game's.
+//!
+//! Beyond the usual candidates, a side behind a router with guessable ports offers the ports it
+//! will probably get next ("predicted"), and a host with a TURN relay offers the relayed
+//! address, the lowest-priority candidate of all. Sans-IO: the owner sends what
+//! [`Link::poll_transmit`] returns, through the relay when it says so.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+#[cfg(test)]
+use std::net::UdpSocket;
 use std::time::Instant;
 
 use is::stun::{StunMessage, StunPacket};
@@ -25,6 +32,10 @@ pub(crate) struct LocalCandidates {
     pub port: u16,
     /// Public addresses for the socket: from STUN, or the router's port mapping.
     pub reflexive: Vec<SocketAddr>,
+    /// Public addresses the router will probably give the socket for new destinations.
+    pub predicted: Vec<SocketAddr>,
+    /// The TURN relay's address for this side, if it has one.
+    pub relay: Option<SocketAddr>,
 }
 
 impl LocalCandidates {
@@ -51,8 +62,30 @@ pub(crate) struct Link {
     locals: Vec<LocalAddr>,
     /// The socket's port.
     port: u16,
-    /// The peer's address on the nominated pair, once there is one.
-    nominated: Option<SocketAddr>,
+    /// The relayed address, if this side offers one.
+    relay: Option<SocketAddr>,
+    /// The nominated pair, once there is one.
+    nominated: Option<Nominated>,
+}
+
+/// A link's nominated pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Nominated {
+    /// The peer's address.
+    pub(crate) peer: SocketAddr,
+    /// The pair runs through this side's TURN relay.
+    pub(crate) relayed: bool,
+}
+
+/// A datagram for the link's owner to send.
+#[derive(Debug)]
+pub(crate) struct Transmit {
+    /// To whom.
+    pub(crate) to: SocketAddr,
+    /// It goes through this side's TURN relay, not straight from the socket.
+    pub(crate) relayed: bool,
+    /// What.
+    pub(crate) data: Vec<u8>,
 }
 
 impl Link {
@@ -70,7 +103,8 @@ impl Link {
                 Err(e) => debug!("skipping local address {addr}: {e}"),
             }
         }
-        for &public in &locals.reflexive {
+        // Predicted ones after the seen ones: they get lower priorities.
+        for &public in locals.reflexive.iter().chain(&locals.predicted) {
             let Some(base) = locals.base_for(public) else {
                 continue;
             };
@@ -81,10 +115,17 @@ impl Link {
                 agent.add_local_candidate(c);
             }
         }
+        if let Some(relay) = locals.relay
+            && let Some(base) = locals.base_for(relay)
+            && let Ok(c) = Candidate::relayed(relay, base, "udp")
+        {
+            agent.add_local_candidate(c);
+        }
         Link {
             agent,
             locals: locals.addrs.clone(),
             port: locals.port,
+            relay: locals.relay,
             nominated: None,
         }
     }
@@ -100,6 +141,7 @@ impl Link {
                 .local_candidates()
                 .map(|c| c.to_sdp_string())
                 .collect(),
+            nat: None,
         }
     }
 
@@ -114,8 +156,8 @@ impl Link {
             ufrag: params.ufrag.clone(),
             pass: params.pwd.clone(),
         });
-        // A small cap on what a peer can make us check.
-        for sdp in params.candidates.iter().take(24) {
+        // A small cap on what a peer can make us check (predicted ports included).
+        for sdp in params.candidates.iter().take(MAX_REMOTE_CANDIDATES) {
             match Candidate::from_sdp_string(sdp) {
                 Ok(c) if c.proto() == Protocol::Udp => self.agent.add_remote_candidate(c),
                 Ok(_) => {}
@@ -150,28 +192,76 @@ impl Link {
         );
     }
 
-    /// Runs the agent's timers and sends its checks from `socket`.
-    pub(crate) fn drive(&mut self, now: Instant, socket: &UdpSocket) {
+    /// Feeds a STUN message that came through this side's TURN relay from `from`.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the agent takes the message by value"
+    )]
+    pub(crate) fn handle_relayed(&mut self, now: Instant, from: SocketAddr, msg: StunMessage<'_>) {
+        let Some(relay) = self.relay else { return };
+        self.agent.handle_packet(
+            now,
+            StunPacket {
+                proto: Protocol::Udp,
+                source: net::canonical(from),
+                destination: relay,
+                message: msg,
+            },
+        );
+    }
+
+    /// Runs the agent's timers.
+    pub(crate) fn drive(&mut self, now: Instant) {
         self.agent.handle_timeout(now);
-        while let Some(t) = self.agent.poll_transmit() {
-            trace!("ICE {} -> {}", t.source, t.destination);
-            if let Err(e) = net::send_to(socket, &t.contents, t.destination) {
-                trace!("ICE send to {}: {e}", t.destination);
-            }
-        }
         while let Some(event) = self.agent.poll_event() {
-            if let IceAgentEvent::NominatedSend { destination, .. } = event {
-                debug!("ICE nominated {destination}");
-                self.nominated = Some(net::canonical(destination));
+            if let IceAgentEvent::NominatedSend {
+                source,
+                destination,
+                ..
+            } = event
+            {
+                let relayed = Some(source) == self.relay;
+                debug!(
+                    "ICE nominated {destination}{}",
+                    if relayed { " (relayed)" } else { "" }
+                );
+                self.nominated = Some(Nominated {
+                    peer: net::canonical(destination),
+                    relayed,
+                });
             }
         }
     }
 
-    /// The peer's address on the nominated pair, once there is one.
-    pub(crate) fn nominated(&self) -> Option<SocketAddr> {
+    /// The next datagram to send.
+    pub(crate) fn poll_transmit(&mut self) -> Option<Transmit> {
+        let t = self.agent.poll_transmit()?;
+        trace!("ICE {} -> {}", t.source, t.destination);
+        Some(Transmit {
+            to: net::canonical(t.destination),
+            relayed: Some(t.source) == self.relay,
+            data: t.contents.to_vec(),
+        })
+    }
+
+    /// Runs the timers and sends the checks from `socket` (none may need the relay).
+    #[cfg(test)]
+    pub(crate) fn drive_on(&mut self, now: Instant, socket: &UdpSocket) {
+        self.drive(now);
+        while let Some(t) = self.poll_transmit() {
+            let _ = net::send_to(socket, &t.data, t.to);
+        }
+        self.drive(now);
+    }
+
+    /// The nominated pair, once there is one.
+    pub(crate) fn nominated(&self) -> Option<Nominated> {
         self.nominated
     }
 }
+
+/// The most candidates taken from a peer.
+const MAX_REMOTE_CANDIDATES: usize = 40;
 
 /// Parses a datagram as a STUN message with ICE credentials.
 pub(crate) fn parse(data: &[u8]) -> Option<StunMessage<'_>> {
@@ -191,7 +281,7 @@ mod tests {
                 default: true,
             }],
             port: 0,
-            reflexive: Vec::new(),
+            ..LocalCandidates::default()
         }
     }
 
@@ -230,11 +320,12 @@ mod tests {
                         link.handle(now, from, msg);
                     }
                 }
-                link.drive(now, socket);
+                link.drive_on(now, socket);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(links[0].nominated(), Some(sockets[1].local_addr().unwrap()));
-        assert_eq!(links[1].nominated(), Some(sockets[0].local_addr().unwrap()));
+        let peer = |l: &Link| l.nominated().map(|n| n.peer);
+        assert_eq!(peer(&links[0]), Some(sockets[1].local_addr().unwrap()));
+        assert_eq!(peer(&links[1]), Some(sockets[0].local_addr().unwrap()));
     }
 }
