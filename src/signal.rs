@@ -27,6 +27,8 @@ use crate::portmap::{self, PortMapEvent};
 
 /// How long shutting down waits for last messages (closing listings, removing port mappings).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long to wait before looking the STUN servers up again when none resolved.
+const STUN_RETRY: Duration = Duration::from_secs(15);
 /// How long a publish waits for a first relay connection.
 const CONNECT_WAIT: Duration = Duration::from_secs(6);
 
@@ -211,7 +213,8 @@ async fn run(
     client.connect().await;
     let mut notifications = client.notifications();
     let mut tasks = JoinSet::new();
-    tasks.spawn(resolve_stun(stun_servers, shared.clone()));
+    // It may wait to try again, so shutting down stops it rather than waiting for it.
+    let resolving = tasks.spawn(resolve_stun(stun_servers, shared.clone()));
     let mut sinks: HashMap<SubscriptionId, Sink<Event>> = HashMap::new();
     // Subscriptions still being sent to the relays. Each runs in a task of its own, so an
     // unsubscribe waits for its subscribe: run first, it would close nothing, and the
@@ -281,6 +284,7 @@ async fn run(
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+    resolving.abort();
     // Let queued publishes and port mapping removals finish, but not forever.
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while tasks.join_next().await.is_some() {}
@@ -360,10 +364,24 @@ async fn publish(client: &Client, shared: &Shared, event: &Event) -> Published {
     }
 }
 
-/// Looks the STUN servers up, all at once, and shares the addresses found.
+/// Looks the STUN servers up and shares the addresses found. While none resolve (the machine
+/// may not be online yet), it shares that and tries again every [`STUN_RETRY`].
 async fn resolve_stun(servers: Vec<String>, shared: Arc<Shared>) {
+    loop {
+        let found = lookup_stun(&servers).await;
+        let done = !found.is_empty() || servers.is_empty();
+        *shared.stun_servers.lock().unwrap() = Some(found);
+        if done {
+            return;
+        }
+        tokio::time::sleep(STUN_RETRY).await;
+    }
+}
+
+/// Looks the STUN servers up, all at once.
+async fn lookup_stun(servers: &[String]) -> Vec<SocketAddr> {
     let mut lookups = JoinSet::new();
-    for server in servers {
+    for server in servers.iter().cloned() {
         lookups.spawn(async move {
             let lookup = tokio::net::lookup_host(server.as_str());
             match tokio::time::timeout(Duration::from_secs(5), lookup).await {
@@ -387,7 +405,7 @@ async fn resolve_stun(servers: Vec<String>, shared: Arc<Shared>) {
         let v6 = addrs.iter().find(|a| a.is_ipv6());
         found.extend(v4.into_iter().chain(v6).copied());
     }
-    *shared.stun_servers.lock().unwrap() = Some(found);
+    found
 }
 
 #[cfg(test)]
