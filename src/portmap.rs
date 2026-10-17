@@ -14,7 +14,7 @@ use igd_next::aio::tokio::{Tokio, search_gateway};
 use igd_next::{AddAnyPortError, AddPortError, PortMappingProtocol, SearchOptions};
 use tokio::sync::oneshot;
 
-use crate::signal::Sink;
+use crate::worker::Sink;
 use tracing::{debug, info};
 
 /// The lease asked for, renewed at half-time.

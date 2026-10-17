@@ -5,7 +5,7 @@
 //! ([`relay`]) owns what needs the host's keys: the listing, and reading and answering join
 //! requests. They exchange plain data.
 
-mod relay;
+mod task;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -23,9 +23,9 @@ use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::Listing;
 use crate::net::{self, LocalAddr};
 use crate::portmap::{PortMapEvent, PortMapMethod};
-use crate::signal::{self, Command, Inbox, Published, Sink};
+use crate::worker::{self, Command, Inbox, Published, Sink};
 use crate::stun::{self, Gatherer};
-use relay::{FromRelay, JoinRequest, Relay, ToRelay};
+use task::{FromTask, JoinRequest, HostTask, ToTask};
 
 /// How long a connected joiner's checks are still answered, for its retransmissions.
 const LINGER: Duration = Duration::from_secs(5);
@@ -88,9 +88,9 @@ pub struct Host {
     started: Instant,
 
     listing: Listing,
-    /// Dropping it ends the relay task, which closes the listing.
-    to_relay: Sink<ToRelay>,
-    from_relay: Inbox<FromRelay>,
+    /// Dropping it ends the worker task, which closes the listing.
+    to_task: Sink<ToTask>,
+    from_task: Inbox<FromTask>,
     published: Inbox<Published>,
     listed_on: usize,
 
@@ -123,11 +123,11 @@ impl Host {
         let filter = Filter::new()
             .kind(HANDSHAKE_KIND)
             .pubkey(keys.public_key());
-        let (subscription, requests) = inner.signal.subscribe(filter);
-        let (port_tx, port_events) = signal::channel();
+        let (subscription, requests) = inner.worker.subscribe(filter);
+        let (port_tx, port_events) = worker::channel();
         let stop = if inner.config.port_mapping {
             let (stop_tx, stop) = oneshot::channel();
-            inner.signal.send(Command::MapPort {
+            inner.worker.send(Command::MapPort {
                 port,
                 events: port_tx,
                 stop,
@@ -141,13 +141,13 @@ impl Host {
             inner.config.game_id,
             keys.public_key()
         );
-        let (to_relay, commands) = signal::channel();
-        let (notices, from_relay) = signal::channel();
-        let (published_tx, published) = signal::channel();
+        let (to_task, commands) = worker::channel();
+        let (notices, from_task) = worker::channel();
+        let (published_tx, published) = worker::channel();
         let relay_parts = (inner.config.clone(), listing.clone());
-        inner.signal.spawn(move |ctx| {
+        inner.worker.spawn(move |ctx| {
             let (config, listing) = relay_parts;
-            Relay {
+            HostTask {
                 ctx,
                 config,
                 keys,
@@ -164,8 +164,8 @@ impl Host {
             socket,
             started: Instant::now(),
             listing,
-            to_relay,
-            from_relay,
+            to_task,
+            from_task,
             published,
             listed_on: 0,
             locals,
@@ -222,7 +222,7 @@ impl Host {
     pub fn set_listing(&mut self, listing: Listing) {
         if listing != self.listing {
             self.listing = listing.clone();
-            let _ = self.to_relay.send(ToRelay::SetListing(listing));
+            let _ = self.to_task.send(ToTask::SetListing(listing));
         }
     }
 
@@ -249,7 +249,7 @@ impl Host {
     /// Learns (again) what the socket looks like from outside.
     fn gather(&mut self, now: Instant) {
         if self.gatherer.is_none() && self.last_gather.is_none_or(|t| now - t >= REGATHER) {
-            let Some(servers) = self.inner.signal.stun_servers() else {
+            let Some(servers) = self.inner.worker.stun_servers() else {
                 return; // still resolving
             };
             let timeout = self.inner.config.gather_timeout;
@@ -308,7 +308,7 @@ impl Host {
         }
     }
 
-    /// The relays' answers to the listings the relay task published.
+    /// The relays' answers to the listings the worker task published.
     fn listing_outcomes(&mut self) {
         while let Ok(p) = self.published.try_recv() {
             if p.accepted == 0 {
@@ -323,12 +323,12 @@ impl Host {
         }
     }
 
-    /// Join requests the relay task accepted (and refusals it sent).
+    /// Join requests the worker task accepted (and refusals it sent).
     fn join_requests(&mut self, now: Instant) {
-        while let Ok(notice) = self.from_relay.try_recv() {
+        while let Ok(notice) = self.from_task.try_recv() {
             match notice {
-                FromRelay::Request(r) => self.early_requests.push(r),
-                FromRelay::Refused { name, reason } => self
+                FromTask::Request(r) => self.early_requests.push(r),
+                FromTask::Refused { name, reason } => self
                     .events
                     .push_back(HostEvent::JoinRefused { name, reason }),
             }
@@ -350,7 +350,7 @@ impl Host {
             r.player_name,
             link.remote_candidates()
         );
-        let _ = self.to_relay.send(ToRelay::Accept {
+        let _ = self.to_task.send(ToTask::Accept {
             to: r.from,
             attempt: r.attempt,
             ice: link.params(),
@@ -397,16 +397,16 @@ impl Host {
         }
         for key in done {
             self.joiners.remove(&key);
-            let _ = self.to_relay.send(ToRelay::JoinerDone(key));
+            let _ = self.to_task.send(ToTask::JoinerDone(key));
         }
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // The relay task sees `to_relay` close, and replaces the listing with a tombstone.
+        // The worker task sees `to_task` close, and replaces the listing with a tombstone.
         self.inner
-            .signal
+            .worker
             .send(Command::Unsubscribe(self.subscription.clone()));
         // Dropping `_port_mapping_stop` removes the port mapping.
     }

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::Config;
 use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
 use crate::listing::{Listing, MAX_NAME, MAX_VERSION, PROTOCOL, clean, listing_event};
-use crate::signal::{Inbox, Published, Sink, TaskContext};
+use crate::worker::{Inbox, Published, Sink, TaskContext};
 
 /// Joiners being connected at once; more are told to wait.
 pub(super) const MAX_JOINERS: usize = 16;
@@ -32,10 +32,10 @@ const REFUSALS_PER_SECOND: u32 = 4;
 const FORGET_FINISHED: Duration = Duration::from_secs(600);
 
 /// From the game thread.
-pub(super) enum ToRelay {
+pub(super) enum ToTask {
     /// The listing changed.
     SetListing(Listing),
-    /// Accept a joiner the relay passed on, with the host's side of the checks.
+    /// Accept a joiner the task passed on, with the host's side of the checks.
     Accept {
         to: PublicKey,
         attempt: String,
@@ -45,7 +45,7 @@ pub(super) enum ToRelay {
     JoinerDone(PublicKey),
 }
 
-/// A join request the relay accepted.
+/// A join request the task accepted.
 pub(super) struct JoinRequest {
     pub from: PublicKey,
     pub attempt: String,
@@ -54,10 +54,10 @@ pub(super) struct JoinRequest {
 }
 
 /// To the game thread.
-pub(super) enum FromRelay {
-    /// A request to connect: the game runs the checks and answers with [`ToRelay::Accept`].
+pub(super) enum FromTask {
+    /// A request to connect: the game runs the checks and answers with [`ToTask::Accept`].
     Request(JoinRequest),
-    /// A player the relay refused (already answered).
+    /// A player the task refused (already answered).
     Refused { name: String, reason: RefuseReason },
 }
 
@@ -69,18 +69,18 @@ struct Active {
     last_sent: Option<Instant>,
 }
 
-pub(super) struct Relay {
+pub(super) struct HostTask {
     pub ctx: TaskContext,
     pub config: Config,
     pub keys: Keys,
     pub listing: Listing,
-    pub commands: Inbox<ToRelay>,
+    pub commands: Inbox<ToTask>,
     pub requests: Inbox<Event>,
-    pub notices: Sink<FromRelay>,
+    pub notices: Sink<FromTask>,
     pub published: Sink<Published>,
 }
 
-impl Relay {
+impl HostTask {
     /// Runs until the game drops its end, then replaces the listing with a tombstone.
     pub async fn run(mut self) {
         let mut state = State {
@@ -117,13 +117,13 @@ impl Relay {
         }
     }
 
-    fn command(&mut self, state: &mut State, command: ToRelay) {
+    fn command(&mut self, state: &mut State, command: ToTask) {
         match command {
-            ToRelay::SetListing(l) => {
+            ToTask::SetListing(l) => {
                 self.listing = l;
                 state.listing_changed = true;
             }
-            ToRelay::Accept { to, attempt, ice } => {
+            ToTask::Accept { to, attempt, ice } => {
                 let Some(active) = state.active.get_mut(&to) else {
                     return;
                 };
@@ -132,7 +132,7 @@ impl Relay {
                 active.accept = Some(accept);
                 active.last_sent = Some(Instant::now());
             }
-            ToRelay::JoinerDone(key) => {
+            ToTask::JoinerDone(key) => {
                 state.active.remove(&key);
                 let now = Instant::now();
                 state.finished.retain(|_, t| now - *t < FORGET_FINISHED);
@@ -226,7 +226,7 @@ impl Relay {
                 reason: reason.clone(),
             };
             self.ctx.send_sealed(&self.keys, &from, &refuse, None);
-            let _ = self.notices.send(FromRelay::Refused {
+            let _ = self.notices.send(FromTask::Refused {
                 name: player_name,
                 reason,
             });
@@ -239,7 +239,7 @@ impl Relay {
                 last_sent: None,
             },
         );
-        let _ = self.notices.send(FromRelay::Request(JoinRequest {
+        let _ = self.notices.send(FromTask::Request(JoinRequest {
             from,
             attempt,
             player_name,

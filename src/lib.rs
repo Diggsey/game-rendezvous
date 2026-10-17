@@ -75,7 +75,7 @@ mod join;
 mod listing;
 mod net;
 mod portmap;
-mod signal;
+mod worker;
 pub mod stun;
 
 use std::io;
@@ -92,7 +92,7 @@ pub use listing::{GameId, GameInfo, Listing};
 pub use net::{bind_dual_stack, canonical, for_socket, send_to};
 pub use portmap::{PortMapEvent, PortMapMethod};
 
-use signal::Signal;
+use worker::Worker;
 
 /// The handles live in game engines' shared state (a Bevy resource needs `Send + Sync`).
 #[allow(dead_code)]
@@ -107,12 +107,12 @@ fn assert_send_sync() {
 /// What hosts, browsers and joins share: the configuration and the background worker.
 pub(crate) struct Inner {
     pub config: Config,
-    pub signal: Signal,
+    pub worker: Worker,
 }
 
 impl Inner {
     fn relays(&self) -> (usize, usize) {
-        (self.signal.relays_connected(), self.config.relays.len())
+        (self.worker.relays_connected(), self.config.relays.len())
     }
 }
 
@@ -129,9 +129,9 @@ pub struct Rendezvous {
 impl Rendezvous {
     /// Starts the background worker and connects to the relays.
     pub fn new(config: Config) -> io::Result<Rendezvous> {
-        let signal = Signal::start(config.relays.clone(), config.stun_servers.clone())?;
+        let worker = Worker::start(config.relays.clone(), config.stun_servers.clone())?;
         Ok(Rendezvous {
-            inner: Arc::new(Inner { config, signal }),
+            inner: Arc::new(Inner { config, worker }),
         })
     }
 

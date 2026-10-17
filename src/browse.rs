@@ -8,7 +8,7 @@ use nostr_sdk::prelude::{Event, Filter, SubscriptionId, Timestamp};
 
 use crate::Inner;
 use crate::listing::{GameId, GameInfo, LISTING_KIND, Parsed, listing_tag, parse_listing};
-use crate::signal::{Command, Inbox};
+use crate::worker::{Command, Inbox};
 
 /// How far back to ask relays for listings. Live ones are refreshed far more often; expired
 /// ones are dropped anyway.
@@ -36,7 +36,7 @@ impl Browser {
             .identifier(listing_tag(&inner.config.game_id))
             .since(Timestamp::now() - LOOKBACK.as_secs())
             .limit(500);
-        let (subscription, events) = inner.signal.subscribe(filter);
+        let (subscription, events) = inner.worker.subscribe(filter);
         Browser {
             inner,
             subscription,
@@ -77,7 +77,7 @@ impl Browser {
 impl Drop for Browser {
     fn drop(&mut self) {
         self.inner
-            .signal
+            .worker
             .send(Command::Unsubscribe(self.subscription.clone()));
     }
 }

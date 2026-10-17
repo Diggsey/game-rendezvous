@@ -5,7 +5,7 @@
 //! The game-facing types never block: they send [`Command`]s here and read answers from
 //! channels ([`Inbox`]) when they are polled. Work that involves the players' keys (signing,
 //! encrypting and decrypting) runs here too, in tasks a host or a join starts with
-//! [`Signal::spawn`], so that nothing a stranger sends costs the game's frame time.
+//! [`Worker::spawn`], so that nothing a stranger sends costs the game's frame time.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -131,19 +131,19 @@ pub(crate) struct Shared {
 /// A handle on the worker; cheap to clone. The worker shuts down when the last handle goes,
 /// after sending what is already queued.
 #[derive(Clone)]
-pub(crate) struct Signal {
+pub(crate) struct Worker {
     commands: tmpsc::UnboundedSender<Command>,
     pub shared: Arc<Shared>,
-    _worker: Arc<Worker>,
+    _thread: Arc<WorkerThread>,
 }
 
-struct Worker {
+struct WorkerThread {
     commands: tmpsc::UnboundedSender<Command>,
     thread: Mutex<Option<JoinHandle<()>>>,
     finished: Mutex<mpsc::Receiver<()>>,
 }
 
-impl Drop for Worker {
+impl Drop for WorkerThread {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
         // Wait (briefly) so that a game exiting right after closing its listing still gets the
@@ -159,9 +159,9 @@ impl Drop for Worker {
     }
 }
 
-impl Signal {
+impl Worker {
     /// Starts the worker, connecting to `relays` and resolving `stun_servers`.
-    pub fn start(relays: Vec<String>, stun_servers: Vec<String>) -> std::io::Result<Signal> {
+    pub fn start(relays: Vec<String>, stun_servers: Vec<String>) -> std::io::Result<Worker> {
         let (tx, rx) = tmpsc::unbounded_channel();
         let shared = Arc::new(Shared::default());
         let (finished_tx, finished) = mpsc::channel();
@@ -178,10 +178,10 @@ impl Signal {
                 runtime.shutdown_background();
                 let _ = finished_tx.send(());
             })?;
-        Ok(Signal {
+        Ok(Worker {
             commands: tx.clone(),
             shared,
-            _worker: Arc::new(Worker {
+            _thread: Arc::new(WorkerThread {
                 commands: tx,
                 thread: Mutex::new(Some(thread)),
                 finished: Mutex::new(finished),

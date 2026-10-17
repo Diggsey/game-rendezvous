@@ -4,7 +4,7 @@
 //! the connectivity checks), and a task on the worker ([`relay`]) what needs the joiner's key
 //! (sealing the request, opening the host's answer).
 
-mod relay;
+mod task;
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -20,9 +20,9 @@ use crate::handshake::{HANDSHAKE_KIND, Message};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::{GameInfo, PROTOCOL};
 use crate::net::{self, LocalAddr};
-use crate::signal::{self, Command, Inbox, Sink};
+use crate::worker::{self, Command, Inbox, Sink};
 use crate::stun::{self, Gatherer};
-use relay::{FromRelay, Relay, SendRequest};
+use task::{FromTask, JoinTask, SendRequest};
 
 /// After nomination, how long the checks go on before the socket is handed over, so that the
 /// host's side of the nominated pair completes too.
@@ -91,10 +91,10 @@ pub struct Join {
     stage: Stage,
     started: Instant,
     subscription: SubscriptionId,
-    /// Dropping it ends the relay task, which repeats the request until the host answers.
+    /// Dropping it ends the worker task, which repeats the request until the host answers.
     /// `None` once the join has finished.
-    to_relay: Option<Sink<SendRequest>>,
-    from_relay: Inbox<FromRelay>,
+    to_task: Option<Sink<SendRequest>>,
+    from_task: Inbox<FromTask>,
     link: Option<Link>,
     symmetric_nat: bool,
     /// Datagrams that are not the library's, kept for the game: (sender, payload).
@@ -128,14 +128,14 @@ impl Join {
             .kind(HANDSHAKE_KIND)
             .pubkey(keys.public_key())
             .author(game.id.0);
-        let (subscription, replies) = inner.signal.subscribe(filter);
+        let (subscription, replies) = inner.worker.subscribe(filter);
         let attempt = format!("{:016x}", rand::random::<u64>());
-        let (to_relay, commands) = signal::channel();
-        let (notices, from_relay) = signal::channel();
+        let (to_task, commands) = worker::channel();
+        let (notices, from_task) = worker::channel();
         let relay_parts = (game.id.0, attempt.clone(), inner.config.handshake_rate);
-        inner.signal.spawn(move |ctx| {
+        inner.worker.spawn(move |ctx| {
             let (host, attempt, handshake_rate) = relay_parts;
-            Relay {
+            JoinTask {
                 ctx,
                 keys,
                 host,
@@ -159,8 +159,8 @@ impl Join {
             stage: Stage::Gathering(None),
             started: now,
             subscription,
-            to_relay: Some(to_relay),
-            from_relay,
+            to_task: Some(to_task),
+            from_task,
             link: None,
             symmetric_nat: false,
             early: Vec::new(),
@@ -185,10 +185,10 @@ impl Join {
         let result = self.step(Instant::now());
         if result.is_some() {
             self.stage = Stage::Finished;
-            // Stops the relay task repeating the request.
-            self.to_relay = None;
+            // Stops the worker task repeating the request.
+            self.to_task = None;
             self.inner
-                .signal
+                .worker
                 .send(Command::Unsubscribe(self.subscription.clone()));
         }
         result
@@ -209,7 +209,7 @@ impl Join {
             Stage::Gathering(gatherer) => {
                 let deadline = self.started + self.inner.config.gather_timeout;
                 if gatherer.is_none()
-                    && let Some(servers) = self.inner.signal.stun_servers()
+                    && let Some(servers) = self.inner.worker.stun_servers()
                 {
                     let left = deadline.saturating_duration_since(now);
                     *gatherer = Some(Gatherer::for_socket(socket, servers, now, left));
@@ -296,9 +296,9 @@ impl Join {
             player_name: self.player_name.clone(),
             ice: link.params(),
         };
-        // Sealed, sent and repeated by the relay task.
-        if let Some(to_relay) = &self.to_relay {
-            let _ = to_relay.send(SendRequest(request));
+        // Sealed, sent and repeated by the worker task.
+        if let Some(to_task) = &self.to_task {
+            let _ = to_task.send(SendRequest(request));
         }
         self.link = Some(link);
         self.stage = Stage::WaitingForHost {
@@ -311,9 +311,9 @@ impl Join {
 
     /// Reads the host's answers and every datagram on the socket.
     fn receive(&mut self, now: Instant) -> Result<(), JoinError> {
-        while let Ok(notice) = self.from_relay.try_recv() {
+        while let Ok(notice) = self.from_task.try_recv() {
             match notice {
-                FromRelay::Published(p) => {
+                FromTask::Published(p) => {
                     let Stage::WaitingForHost {
                         since,
                         published,
@@ -330,13 +330,13 @@ impl Join {
                         }
                     } else if !*published {
                         // With no relay connected, no repeat will do better.
-                        if self.inner.signal.relays_connected() == 0 {
+                        if self.inner.worker.relays_connected() == 0 {
                             return Err(JoinError::RelaysUnavailable(p.errors.join("; ")));
                         }
                         *relay_errors = Some(p.errors.join("; "));
                     }
                 }
-                FromRelay::Accepted(ice) => {
+                FromTask::Accepted(ice) => {
                     if let (Some(link), Stage::WaitingForHost { .. }) =
                         (&mut self.link, &self.stage)
                     {
@@ -348,7 +348,7 @@ impl Join {
                         self.stage = Stage::Connecting { since: now };
                     }
                 }
-                FromRelay::Refused(reason) => return Err(JoinError::Refused(reason)),
+                FromTask::Refused(reason) => return Err(JoinError::Refused(reason)),
             }
         }
         let Some(socket) = &self.socket else {
@@ -394,7 +394,7 @@ impl Drop for Join {
     fn drop(&mut self) {
         if !matches!(self.stage, Stage::Finished) {
             self.inner
-                .signal
+                .worker
                 .send(Command::Unsubscribe(self.subscription.clone()));
         }
     }

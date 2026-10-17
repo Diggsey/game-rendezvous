@@ -8,7 +8,7 @@ use nostr_sdk::prelude::{Event, Keys, PublicKey};
 use tracing::debug;
 
 use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
-use crate::signal::{Inbox, Published, Sink, TaskContext};
+use crate::worker::{Inbox, Published, Sink, TaskContext};
 
 /// How often the join request is repeated until the host answers: relays may lose an
 /// ephemeral event.
@@ -18,7 +18,7 @@ const REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) struct SendRequest(pub Message);
 
 /// To the game thread.
-pub(super) enum FromRelay {
+pub(super) enum FromTask {
     /// How the relays took a copy of the request: each copy is reported until one is taken.
     Published(Published),
     /// The host accepted: its side of the checks.
@@ -26,7 +26,7 @@ pub(super) enum FromRelay {
     Refused(RefuseReason),
 }
 
-pub(super) struct Relay {
+pub(super) struct JoinTask {
     pub ctx: TaskContext,
     pub keys: Keys,
     pub host: PublicKey,
@@ -34,21 +34,21 @@ pub(super) struct Relay {
     pub handshake_rate: u32,
     pub commands: Inbox<SendRequest>,
     pub replies: Inbox<Event>,
-    pub notices: Sink<FromRelay>,
+    pub notices: Sink<FromTask>,
 }
 
-impl Relay {
+impl JoinTask {
     /// Runs until the host answers or the game drops its end.
     pub async fn run(mut self) {
         let Some(SendRequest(request)) = self.commands.recv().await else {
             return;
         };
-        let (published_tx, mut published) = crate::signal::channel();
+        let (published_tx, mut published) = crate::worker::channel();
         let sent = self
             .ctx
             .send_sealed(&self.keys, &self.host, &request, Some(published_tx.clone()));
         if !sent {
-            let _ = self.notices.send(FromRelay::Published(Published {
+            let _ = self.notices.send(FromTask::Published(Published {
                 accepted: 0,
                 errors: vec!["could not sign the request".into()],
             }));
@@ -66,7 +66,7 @@ impl Relay {
                 Some(p) = published.recv() => {
                     if !taken {
                         taken = p.accepted > 0;
-                        let _ = self.notices.send(FromRelay::Published(p));
+                        let _ = self.notices.send(FromTask::Published(p));
                     }
                 }
                 _ = repeat.tick() => {
@@ -84,16 +84,16 @@ impl Relay {
     }
 
     /// The host's answer to this attempt in `reply`, if that is what it is.
-    fn open(&self, budget: &mut RateBudget, reply: &Event) -> Option<FromRelay> {
+    fn open(&self, budget: &mut RateBudget, reply: &Event) -> Option<FromTask> {
         if reply.pubkey != self.host || !budget.take() {
             return None;
         }
         match handshake::open(&self.keys, reply) {
             Some(Message::Accept { attempt, ice }) if attempt == self.attempt => {
-                Some(FromRelay::Accepted(ice))
+                Some(FromTask::Accepted(ice))
             }
             Some(Message::Refuse { attempt, reason }) if attempt == self.attempt => {
-                Some(FromRelay::Refused(reason))
+                Some(FromTask::Refused(reason))
             }
             _ => {
                 debug!("ignoring a handshake message that is not for this attempt");
