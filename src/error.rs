@@ -72,7 +72,14 @@ impl fmt::Display for JoinError {
     }
 }
 
-impl std::error::Error for JoinError {}
+impl std::error::Error for JoinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            JoinError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for JoinError {
     fn from(e: io::Error) -> Self {
@@ -83,6 +90,14 @@ impl From<io::Error> for JoinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_errors_are_the_source() {
+        use std::error::Error;
+        let e = JoinError::from(io::Error::other("boom"));
+        assert_eq!(e.source().unwrap().to_string(), "boom");
+        assert!(JoinError::HostNotResponding.source().is_none());
+    }
 
     #[test]
     fn no_route_message_reads_as_one_line() {
