@@ -150,6 +150,9 @@ impl Signal {
             .name("game_rendezvous".into())
             .spawn(move || {
                 runtime.block_on(run(relays, stun_servers, rx, worker_shared));
+                // Dropping the runtime would wait for blocking calls that cannot be cancelled
+                // (a name lookup, the interface list); leave them to finish on their own.
+                runtime.shutdown_background();
                 let _ = finished_tx.send(());
             })?;
         Ok(Signal {
