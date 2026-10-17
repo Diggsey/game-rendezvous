@@ -27,6 +27,9 @@ const RESEND_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// host rate-limited by the relays, its listing with it. A refused joiner repeats its request,
 /// so one turned away unanswered is answered later.
 const REFUSALS_PER_SECOND: u32 = 4;
+/// How long a joiner the game is done with is remembered, and the oldest a request may be:
+/// a late repeat, or a request a relay replays, must not start a join over again.
+const FORGET_FINISHED: Duration = Duration::from_secs(600);
 
 /// From the game thread.
 pub(super) enum ToRelay {
@@ -85,6 +88,7 @@ impl Relay {
             last_publish: None,
             last_created: None,
             active: HashMap::new(),
+            finished: HashMap::new(),
             budget: RateBudget::new(self.config.handshake_rate, "handshake messages unread"),
             refusals: RateBudget::new(REFUSALS_PER_SECOND, "refusals unsent"),
         };
@@ -132,6 +136,9 @@ impl Relay {
             }
             ToRelay::JoinerDone(key) => {
                 state.active.remove(&key);
+                let now = Instant::now();
+                state.finished.retain(|_, t| now - *t < FORGET_FINISHED);
+                state.finished.insert(key, now);
             }
         }
     }
@@ -170,6 +177,14 @@ impl Relay {
                 active.last_sent = Some(now);
                 self.ctx.publish_in_background(event, None);
             }
+            return;
+        }
+        if state.finished.contains_key(&from) {
+            debug!("ignoring a request from a joiner already done with");
+            return;
+        }
+        if event.created_at + FORGET_FINISHED.as_secs() < Timestamp::now() {
+            debug!("ignoring a stale handshake message");
             return;
         }
         if !state.budget.take() {
@@ -243,6 +258,8 @@ struct State {
     /// The date of the last listing published: each copy must be dated after the last.
     last_created: Option<Timestamp>,
     active: HashMap<PublicKey, Active>,
+    /// Joiners the game is done with, and when.
+    finished: HashMap<PublicKey, Instant>,
     budget: RateBudget,
     refusals: RateBudget,
 }
