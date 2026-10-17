@@ -1,7 +1,7 @@
 //! Asking the router to forward a host's port: UPnP IGD, and PCP with NAT-PMP as its fallback.
 //!
-//! Both are tried at once, since a router may speak either. The mapping is renewed while the
-//! host runs and removed when it stops; its lease is short, so a host that crashes leaves a
+//! Both are tried at once, since a router may speak either. Every mapping made is renewed while
+//! the host runs and removed when it stops; the lease is short, so a host that crashes leaves a
 //! mapping behind for minutes at most (unless the router only allows permanent UPnP leases).
 
 use std::fmt;
@@ -215,6 +215,8 @@ async fn map_pcp(local: SocketAddr, gateway: Ipv4Addr) -> Result<Mapping, String
 
 /// Maps `port` on the router, reports to `events`, renews the mapping until `stop` fires (or
 /// its sender is dropped), then removes it.
+/// Maps `port` on the router, reports to `events`, renews the mapping until `stop` fires (or
+/// its sender is dropped), then removes it.
 pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot::Receiver<()>) {
     let Some((local_ip, gateway)) = tokio::task::spawn_blocking(default_route)
         .await
@@ -226,19 +228,34 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot
     };
     let local = SocketAddr::from((local_ip, port));
     let (upnp, pcp) = tokio::join!(map_upnp(local), map_pcp(local, gateway));
-    // Keep one; PCP/NAT-PMP if both worked (it reports the external address directly).
-    let mut mapping = match (pcp, upnp) {
-        (Ok(p), Ok(u)) => {
-            u.remove().await;
-            p
-        }
-        (Ok(m), Err(_)) | (Err(_), Ok(m)) => m,
-        (Err(a), Err(b)) => {
-            debug!("no port mapping: {a}; {b}");
-            let _ = events.send(PortMapEvent::Failed(format!("{a}; {b}")));
+    let mut mappings = match successes([pcp, upnp]) {
+        Ok(m) => m,
+        Err(why) => {
+            debug!("no port mapping: {why}");
+            let _ = events.send(PortMapEvent::Failed(why));
             return;
         }
     };
+    report(&mappings[0], port, &events).await;
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            () = tokio::time::sleep(LEASE / 2) => {
+                for m in &mut mappings {
+                    if let Err(e) = m.renew().await {
+                        debug!("could not renew the {} port mapping: {e}", m.method());
+                    }
+                }
+            }
+        }
+    }
+    for m in mappings {
+        m.remove().await;
+    }
+}
+
+/// Tells the host about `mapping`.
+async fn report(mapping: &Mapping, port: u16, events: &Sink<PortMapEvent>) {
     let external_ip = mapping.external_ip().await;
     info!(
         "{} mapped port {} to {:?}:{}",
@@ -252,15 +269,50 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot
         external_port: mapping.external_port(),
         method: mapping.method(),
     });
-    loop {
-        tokio::select! {
-            _ = &mut stop => break,
-            _ = tokio::time::sleep(LEASE / 2) => {
-                if let Err(e) = mapping.renew().await {
-                    debug!("could not renew the {} port mapping: {e}", mapping.method());
-                }
-            }
+}
+
+/// The mappings that were made, in the order tried, or every reason none was.
+///
+/// All of them are kept, renewed and removed at the end, rather than the extras being removed
+/// at once: routers running miniupnpd serve UPnP, NAT-PMP and PCP from one table of redirects,
+/// so two protocols mapping the same port make one rule, and removing either mapping removes
+/// the rule the other one reported. Keeping both costs a renewal each.
+fn successes<T, const N: usize>(results: [Result<T, String>; N]) -> Result<Vec<T>, String> {
+    let mut made = Vec::new();
+    let mut errors = Vec::new();
+    for r in results {
+        match r {
+            Ok(m) => made.push(m),
+            Err(e) => errors.push(e),
         }
     }
-    mapping.remove().await;
+    if made.is_empty() {
+        Err(errors.join("; "))
+    } else {
+        Ok(made)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_mapping_made_is_kept_in_order() {
+        let both: [Result<&str, String>; 2] = [Ok("pcp"), Ok("upnp")];
+        assert_eq!(successes(both), Ok(vec!["pcp", "upnp"]));
+        let one: [Result<&str, String>; 2] = [Err("PCP: no".into()), Ok("upnp")];
+        assert_eq!(successes(one), Ok(vec!["upnp"]));
+        let none: [Result<&str, String>; 2] = [Err("PCP: no".into()), Err("UPnP: no".into())];
+        assert_eq!(successes(none), Err("PCP: no; UPnP: no".into()));
+    }
+
+    #[test]
+    fn methods_print_as_their_usual_names() {
+        let names: Vec<String> = [PortMapMethod::Upnp, PortMapMethod::NatPmp, PortMapMethod::Pcp]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["UPnP", "NAT-PMP", "PCP"]);
+    }
 }
