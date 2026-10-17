@@ -27,6 +27,8 @@ use relay::{FromRelay, Relay, SendRequest};
 /// After nomination, how long the checks go on before the socket is handed over, so that the
 /// host's side of the nominated pair completes too.
 const SETTLE: Duration = Duration::from_millis(300);
+/// Room for the largest UDP payload, so that no datagram is too big to read.
+const RECV_BUFFER: usize = 65_536;
 
 /// How far a join has got, for showing to the player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,7 @@ pub struct Join {
     from_relay: Inbox<FromRelay>,
     link: Option<Link>,
     symmetric_nat: bool,
+    buf: Box<[u8]>,
 }
 
 impl Join {
@@ -153,6 +156,7 @@ impl Join {
             from_relay,
             link: None,
             symmetric_nat: false,
+            buf: vec![0; RECV_BUFFER].into_boxed_slice(),
         })
     }
 
@@ -339,16 +343,20 @@ impl Join {
         let Some(socket) = &self.socket else {
             return Ok(());
         };
-        let mut buf = [0u8; 1500];
         loop {
-            let (n, from) = match socket.recv_from(&mut buf) {
+            let (n, from) = match socket.recv_from(&mut self.buf) {
                 Ok(r) => r,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 // Windows: an ICMP "port unreachable" for an earlier check.
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(e) => return Err(e.into()),
+                // A datagram that cannot be read must not end a join that may still work; the
+                // next poll reads on.
+                Err(e) => {
+                    debug!("joiner socket: {e}");
+                    return Ok(());
+                }
             };
-            let data = &buf[..n];
+            let data = &self.buf[..n];
             if !stun::is_stun(data) {
                 continue;
             }
