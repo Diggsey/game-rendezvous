@@ -2,7 +2,16 @@
 name = "game_rendezvous"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Internet game discovery over Nostr relays and peer-to-peer UDP connections through NATs"
+authors = ["Diggory Blake"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Diggsey/game-rendezvous"
+documentation = "https://docs.rs/game_rendezvous"
+readme = "README.md"
+keywords = ["gamedev", "matchmaking", "nat-traversal", "nostr", "p2p"]
+categories = ["game-development", "network-programming"]
+exclude = ["/.github", "/clippy.toml"]
 publish = false
 
 [dependencies]
