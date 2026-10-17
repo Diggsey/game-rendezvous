@@ -11,7 +11,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr_sdk::prelude::{Filter, Keys, SubscriptionId, Timestamp};
+use nostr_sdk::prelude::{Filter, Keys, SubscriptionId};
 use tracing::{debug, info};
 
 use crate::Inner;
@@ -109,11 +109,12 @@ impl Join {
         let port = socket.local_addr()?.port();
         let locals = net::local_addrs(&socket, inner.config.local_addresses.as_deref());
         let keys = Keys::generate();
+        // No `since`: nothing can be addressed to a key made just now, and a `since` from this
+        // clock would hide the answer of a host whose clock is behind.
         let filter = Filter::new()
             .kind(HANDSHAKE_KIND)
             .pubkey(keys.public_key())
-            .author(game.id.0)
-            .since(Timestamp::now() - 10);
+            .author(game.id.0);
         let (subscription, replies) = inner.signal.subscribe(filter);
         let attempt = format!("{:016x}", rand::random::<u64>());
         let (to_relay, commands) = signal::channel();

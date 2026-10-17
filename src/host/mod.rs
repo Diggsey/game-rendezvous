@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr_sdk::prelude::{Filter, Keys, PublicKey, SubscriptionId, Timestamp};
+use nostr_sdk::prelude::{Filter, Keys, PublicKey, SubscriptionId};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
@@ -111,10 +111,11 @@ impl Host {
         let keys = Keys::generate();
         let port = socket.local_addr()?.port();
         let locals = net::local_addrs(&socket, inner.config.local_addresses.as_deref());
+        // No `since`: nothing can be addressed to a key made just now, and a `since` from this
+        // clock would hide the requests of a joiner whose clock is behind.
         let filter = Filter::new()
             .kind(HANDSHAKE_KIND)
-            .pubkey(keys.public_key())
-            .since(Timestamp::now() - 10);
+            .pubkey(keys.public_key());
         let (subscription, requests) = inner.signal.subscribe(filter);
         let (port_tx, port_events) = signal::channel();
         let stop = if inner.config.port_mapping {
