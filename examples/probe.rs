@@ -38,7 +38,7 @@ fn main() {
     let status = host.status();
     println!(
         "relays connected: {} of {}",
-        status.relays.0, status.relays.1
+        status.relays.connected, status.relays.total
     );
     println!("public addresses (STUN): {:?}", status.public_addresses);
     println!("router port mapping: {:?}", status.port_mapping);

@@ -104,6 +104,16 @@ fn assert_send_sync() {
     check::<Join>();
 }
 
+/// How many of the configured relays are connected, from [`Rendezvous::relays`] and the
+/// like.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RelayCount {
+    /// Relays connected now.
+    pub connected: usize,
+    /// Relays configured ([`Config::relays`]).
+    pub total: usize,
+}
+
 /// What hosts, browsers and joins share: the configuration and the background worker.
 pub(crate) struct Inner {
     pub config: Config,
@@ -111,8 +121,11 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    fn relays(&self) -> (usize, usize) {
-        (self.worker.relays_connected(), self.config.relays.len())
+    fn relays(&self) -> RelayCount {
+        RelayCount {
+            connected: self.worker.relays_connected(),
+            total: self.config.relays.len(),
+        }
     }
 }
 
@@ -140,7 +153,7 @@ impl Rendezvous {
     }
 
     /// How many relays are connected, of how many configured.
-    pub fn relays(&self) -> (usize, usize) {
+    pub fn relays(&self) -> RelayCount {
         self.inner.relays()
     }
 

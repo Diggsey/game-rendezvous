@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use nostr_sdk::prelude::{Event, Filter, SubscriptionId, Timestamp};
 
-use crate::Inner;
+use crate::{Inner, RelayCount};
 use crate::listing::{GameId, GameInfo, LISTING_KIND, Parsed, listing_tag, parse_listing};
 use crate::worker::{Command, Inbox};
 
@@ -69,7 +69,7 @@ impl Browser {
     }
 
     /// How many relays are connected, of how many configured.
-    pub fn relays(&self) -> (usize, usize) {
+    pub fn relays(&self) -> RelayCount {
         self.inner.relays()
     }
 }

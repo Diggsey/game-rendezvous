@@ -17,7 +17,7 @@ use nostr_sdk::prelude::{Filter, Keys, PublicKey, SubscriptionId};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::Inner;
+use crate::{Inner, RelayCount};
 use crate::handshake::{HANDSHAKE_KIND, RefuseReason};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::Listing;
@@ -59,7 +59,7 @@ pub enum HostEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostStatus {
     /// Relays connected, of how many configured.
-    pub relays: (usize, usize),
+    pub relays: RelayCount,
     /// Relays that took the latest listing.
     pub listed_on: usize,
     /// The router's forwarded address and the protocol that opened it.
