@@ -149,7 +149,10 @@ fn join_connects_on_localhost() {
     );
 
     // Game traffic flows both ways on the connected sockets.
-    assert!(conn.received.is_empty(), "the host's game has sent nothing yet");
+    assert!(
+        conn.received.is_empty(),
+        "the host's game has sent nothing yet"
+    );
     game_rendezvous::send_to(&conn.socket, b"hello host", conn.peer).unwrap();
     let client_addr = wait_for(WAIT, "the client's datagram", || {
         host.frame();
@@ -333,7 +336,12 @@ fn a_flood_of_junk_requests_does_not_reach_the_game() {
         flood.push(event);
     }
     for i in 0..50 {
-        flood.push(forged_request(&host_key, "another-game", "1.0", &format!("Spam {i}")));
+        flood.push(forged_request(
+            &host_key,
+            "another-game",
+            "1.0",
+            &format!("Spam {i}"),
+        ));
     }
     net.send(&client, &flood);
 
@@ -422,7 +430,14 @@ fn a_flood_of_refusable_requests_gets_few_refusals() {
     let host_key = net.host_key(&client);
 
     let flood: Vec<_> = (0..100)
-        .map(|i| forged_request(&host_key, "game-rendezvous-test", "0.1", &format!("Old {i}")))
+        .map(|i| {
+            forged_request(
+                &host_key,
+                "game-rendezvous-test",
+                "0.1",
+                &format!("Old {i}"),
+            )
+        })
         .collect();
     let from_host = Filter::new().kind(HANDSHAKE_KIND).author(host_key);
     let watcher = net.client();
@@ -465,7 +480,14 @@ fn silent_joiners_hold_their_places_only_briefly() {
 
     // Every place taken by requests whose senders never check.
     let silent: Vec<_> = (0..16)
-        .map(|i| forged_request(&host_key, "game-rendezvous-test", "1.0", &format!("Ghost {i}")))
+        .map(|i| {
+            forged_request(
+                &host_key,
+                "game-rendezvous-test",
+                "1.0",
+                &format!("Ghost {i}"),
+            )
+        })
         .collect();
     net.send(&client, &silent);
     for _ in 0..100 {
@@ -479,15 +501,19 @@ fn silent_joiners_hold_their_places_only_briefly() {
     }
 
     // Well before the connection timeout, the silent ones are let go.
-    wait_for(Duration::from_secs(10), "the silent joiners to be let go", || {
-        host.frame();
-        let failed = host
-            .events
-            .iter()
-            .filter(|e| matches!(e, HostEvent::PeerFailed { .. }))
-            .count();
-        (failed == 16).then_some(())
-    });
+    wait_for(
+        Duration::from_secs(10),
+        "the silent joiners to be let go",
+        || {
+            host.frame();
+            let failed = host
+                .events
+                .iter()
+                .filter(|e| matches!(e, HostEvent::PeerFailed { .. }))
+                .count();
+            (failed == 16).then_some(())
+        },
+    );
     let mut join = client_rv.join(&game, "Bob").unwrap();
     finish_join(&mut join, &mut host).expect("a place for a real player");
 }

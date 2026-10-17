@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use game_rendezvous::{Config, Host, HostEvent, Listing, Rendezvous, bind_dual_stack};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, FinalizeEvent, Filter, Keys, Kind, LocalRelay, PublicKey,
+    Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, LocalRelay, PublicKey,
     RateLimit, Tag, nip44,
 };
 
@@ -109,7 +109,10 @@ impl TestNet {
             let deadline = tokio::time::Instant::now() + period;
             while let Ok(Some(n)) = tokio::time::timeout_at(deadline, notifications.next()).await {
                 if let ClientNotification::Message { message, .. } = n
-                    && let RelayMessage::Event { subscription_id, event } = *message
+                    && let RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } = *message
                     && *subscription_id == id
                 {
                     seen.insert(event.id);
