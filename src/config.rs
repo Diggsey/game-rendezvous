@@ -127,6 +127,13 @@ impl fmt::Debug for Config {
             .field("stun_servers", &self.stun_servers)
             .field("port_mapping", &self.port_mapping)
             .field("local_addresses", &self.local_addresses)
+            .field("listing_ttl", &self.listing_ttl)
+            .field("listing_refresh", &self.listing_refresh)
+            .field("gather_timeout", &self.gather_timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("handshake_rate", &self.handshake_rate)
+            // `compatible` is a function.
             .finish_non_exhaustive()
     }
 }
