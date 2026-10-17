@@ -23,30 +23,40 @@ pub(super) enum FromTask {
     Published(Published),
     /// The host accepted: its side of the checks.
     Accepted(IceParams),
+    /// The host refused.
     Refused(RefuseReason),
 }
 
+/// The joiner's task on the worker: see the module documentation.
 pub(super) struct JoinTask {
-    pub ctx: TaskContext,
-    pub keys: Keys,
-    pub host: PublicKey,
-    pub attempt: String,
-    pub handshake_rate: u32,
-    pub commands: Inbox<SendRequest>,
-    pub replies: Inbox<Event>,
-    pub notices: Sink<FromTask>,
+    /// The worker's relay client.
+    pub(super) ctx: TaskContext,
+    /// This attempt's key.
+    pub(super) keys: Keys,
+    /// The host's key.
+    pub(super) host: PublicKey,
+    /// This attempt, as the request names it.
+    pub(super) attempt: String,
+    /// Handshake messages decrypted a second at most.
+    pub(super) handshake_rate: u32,
+    /// From the game thread; closed when the join ends.
+    pub(super) commands: Inbox<SendRequest>,
+    /// Handshake events from the host.
+    pub(super) replies: Inbox<Event>,
+    /// To the game thread.
+    pub(super) notices: Sink<FromTask>,
 }
 
 impl JoinTask {
     /// Runs until the host answers or the game drops its end.
-    pub async fn run(mut self) {
+    pub(super) async fn run(mut self) {
         let Some(SendRequest(request)) = self.commands.recv().await else {
             return;
         };
         let (published_tx, mut published) = crate::worker::channel();
-        let sent = self
-            .ctx
-            .send_sealed(&self.keys, &self.host, &request, Some(published_tx.clone()));
+        let sent =
+            self.ctx
+                .send_sealed(&self.keys, &self.host, &request, Some(published_tx.clone()));
         if !sent {
             let _ = self.notices.send(FromTask::Published(Published {
                 accepted: 0,

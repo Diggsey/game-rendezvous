@@ -17,11 +17,15 @@ pub(crate) const HANDSHAKE_KIND: Kind = Kind::Custom(21_059);
 /// One side's ICE credentials and address candidates (SDP `candidate:` lines).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IceParams {
-    pub ufrag: String,
-    pub pwd: String,
-    pub candidates: Vec<String>,
+    /// The ICE username fragment.
+    pub(crate) ufrag: String,
+    /// The ICE password.
+    pub(crate) pwd: String,
+    /// The candidates, as SDP `candidate:` lines.
+    pub(crate) candidates: Vec<String>,
 }
 
+/// What the handshake's events carry, as JSON, encrypted.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Message {
@@ -29,17 +33,29 @@ pub(crate) enum Message {
     Request {
         /// Tells this attempt's answer from another's.
         attempt: String,
+        /// The joiner's game id ([`Config::game_id`](crate::Config::game_id)).
         game_id: String,
+        /// The joiner's game version.
         version: String,
+        /// The joiner's listing and handshake protocol (`listing::PROTOCOL`).
         protocol: u32,
+        /// The player's name, for the host to show.
         player_name: String,
+        /// The joiner's side of the checks.
         ice: IceParams,
     },
     /// Host to joiner: go ahead and check these addresses.
-    Accept { attempt: String, ice: IceParams },
+    Accept {
+        /// The request's attempt.
+        attempt: String,
+        /// The host's side of the checks.
+        ice: IceParams,
+    },
     /// Host to joiner: not joinable.
     Refuse {
+        /// The request's attempt.
         attempt: String,
+        /// Why.
         reason: RefuseReason,
     },
 }
@@ -50,7 +66,10 @@ pub(crate) enum Message {
 #[non_exhaustive]
 pub enum RefuseReason {
     /// The host's version does not accept the joiner's.
-    IncompatibleVersion { host_version: String },
+    IncompatibleVersion {
+        /// The host's version, for the player to see which they need.
+        host_version: String,
+    },
     /// The host is not taking players now (its listing is not joinable).
     NotAccepting,
     /// The host is handling too many join attempts at once.
@@ -84,17 +103,21 @@ pub(crate) fn open(keys: &Keys, event: &Event) -> Option<Message> {
 /// Caps how often per second something a stranger can cause happens: decrypting a handshake
 /// message, or publishing a refusal.
 pub(crate) struct RateBudget {
+    /// How many times a second it may happen.
     per_second: u32,
     /// What is dropped over budget, for the log, e.g. "handshake messages unread".
     what: &'static str,
+    /// When the current one-second window began.
     window: Instant,
+    /// Times it happened in the current window.
     used: u32,
     /// Times dropped in the current window, reported once it ends.
     dropped: u32,
 }
 
 impl RateBudget {
-    pub fn new(per_second: u32, what: &'static str) -> Self {
+    /// A budget of `per_second`; `what` names what is dropped over it, for the log.
+    pub(crate) fn new(per_second: u32, what: &'static str) -> Self {
         RateBudget {
             per_second,
             what,
@@ -105,7 +128,7 @@ impl RateBudget {
     }
 
     /// Whether it may happen once more now.
-    pub fn take(&mut self) -> bool {
+    pub(crate) fn take(&mut self) -> bool {
         let now = Instant::now();
         if now - self.window >= Duration::from_secs(1) {
             if self.dropped > 0 {

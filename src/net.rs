@@ -13,20 +13,24 @@ use socket2::{Domain, Protocol, SockRef, Socket, Type};
 ///
 /// Falls back to an IPv4-only socket where IPv6 is unavailable. Broadcast is enabled, so the
 /// socket can also do LAN discovery (send to `255.255.255.255` through [`send_to`]).
+///
+/// # Errors
+///
+/// If neither socket can be made or bound, e.g. because `port` is taken.
 pub fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
-    let socket = match dual_stack_socket(port) {
-        Ok(s) => s,
-        Err(_) => {
-            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-            s.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
-            s
-        }
+    let socket = if let Ok(s) = dual_stack_socket(port) {
+        s
+    } else {
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        s.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+        s
     };
     socket.set_nonblocking(true)?;
     let _ = socket.set_broadcast(true);
     Ok(socket.into())
 }
 
+/// An IPv6 socket on `port` with `IPV6_V6ONLY` off.
 fn dual_stack_socket(port: u16) -> io::Result<Socket> {
     let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     s.set_only_v6(false)?;
@@ -36,17 +40,24 @@ fn dual_stack_socket(port: u16) -> io::Result<Socket> {
 
 /// `addr` with an IPv4-mapped IPv6 address turned back into IPv4, so that a peer has one
 /// address whichever kind of socket heard it.
+///
+/// ```
+/// let mapped = "[::ffff:192.0.2.7]:7777".parse().unwrap();
+/// assert_eq!(game_rendezvous::canonical(mapped), "192.0.2.7:7777".parse().unwrap());
+/// ```
+#[must_use]
 pub fn canonical(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
             Some(v4) => SocketAddr::from((v4, v6.port())),
             None => addr,
         },
-        v4 => v4,
+        v4 @ SocketAddr::V4(_) => v4,
     }
 }
 
 /// `addr` in the form `socket` can send to: IPv4-mapped on an IPv6 socket.
+#[must_use]
 pub fn for_socket(socket: &UdpSocket, addr: SocketAddr) -> SocketAddr {
     match (socket.local_addr(), addr) {
         (Ok(SocketAddr::V6(_)), SocketAddr::V4(v4)) => {
@@ -57,6 +68,10 @@ pub fn for_socket(socket: &UdpSocket, addr: SocketAddr) -> SocketAddr {
 }
 
 /// Sends `data` to `to`, whether `to` is IPv4 or IPv6 and whether the socket is dual-stack.
+///
+/// # Errors
+///
+/// As [`UdpSocket::send_to`].
 pub fn send_to(socket: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<usize> {
     socket.send_to(data, for_socket(socket, to))
 }
@@ -64,16 +79,21 @@ pub fn send_to(socket: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<us
 /// The address families a socket can reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Families {
-    pub v4: bool,
-    pub v6: bool,
+    /// It reaches IPv4 addresses.
+    pub(crate) v4: bool,
+    /// It reaches IPv6 addresses.
+    pub(crate) v6: bool,
 }
 
 impl Families {
     /// What `socket` reaches: IPv4 for an IPv4 socket; IPv6 for an IPv6 one, and IPv4 too
     /// unless `IPV6_V6ONLY` is on (as it is by default on Windows for std's `[::]` sockets).
-    pub fn of(socket: &UdpSocket) -> Families {
+    pub(crate) fn of(socket: &UdpSocket) -> Families {
         match socket.local_addr() {
-            Ok(SocketAddr::V4(_)) => Families { v4: true, v6: false },
+            Ok(SocketAddr::V4(_)) => Families {
+                v4: true,
+                v6: false,
+            },
             Ok(SocketAddr::V6(_)) => {
                 let only_v6 = SockRef::from(socket).only_v6().unwrap_or(false);
                 Families {
@@ -89,7 +109,7 @@ impl Families {
     }
 
     /// Whether the socket reaches `ip`.
-    pub fn reaches(self, ip: IpAddr) -> bool {
+    pub(crate) fn reaches(self, ip: IpAddr) -> bool {
         if ip.is_ipv4() { self.v4 } else { self.v6 }
     }
 }
@@ -97,10 +117,12 @@ impl Families {
 /// One of this machine's addresses, with its network's prefix length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LocalAddr {
-    pub ip: IpAddr,
-    pub prefix: u8,
+    /// The address.
+    pub(crate) ip: IpAddr,
+    /// Its network's prefix length.
+    pub(crate) prefix: u8,
     /// On the interface that holds the default route.
-    pub default: bool,
+    pub(crate) default: bool,
 }
 
 /// The addresses a socket can be reached on directly: its LAN addresses and global IPv6
@@ -195,6 +217,7 @@ pub(crate) fn guess_destination(locals: &[LocalAddr], from: IpAddr) -> Option<Ip
         .map(|l| l.ip)
 }
 
+/// Whether `a` and `b` share their first `prefix` bits.
 fn same_network(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
     match (a, b) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
@@ -249,10 +272,22 @@ mod tests {
                 .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
                 .unwrap();
             let v6_only: UdpSocket = v6_only.into();
-            assert_eq!(Families::of(&v6_only), Families { v4: false, v6: true });
+            assert_eq!(
+                Families::of(&v6_only),
+                Families {
+                    v4: false,
+                    v6: true
+                }
+            );
         }
         let v4 = UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert_eq!(Families::of(&v4), Families { v4: true, v6: false });
+        assert_eq!(
+            Families::of(&v4),
+            Families {
+                v4: true,
+                v6: false
+            }
+        );
     }
 
     #[test]

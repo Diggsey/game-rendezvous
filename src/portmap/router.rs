@@ -18,22 +18,30 @@ use tracing::{debug, info};
 use super::{PortMapEvent, PortMapMethod};
 use crate::worker::Sink;
 
-/// The lease asked for, renewed at half-time.
-const LEASE: Duration = Duration::from_secs(600);
+/// The lease asked for, in seconds, renewed at half-time.
+const LEASE_SECS: u32 = 600;
 /// How long to look for a gateway.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A port mapping the router made.
 enum Mapping {
+    /// By UPnP.
     Upnp {
+        /// The router.
         gateway: igd_next::aio::Gateway<Tokio>,
+        /// The port forwarded.
         external_port: u16,
+        /// Where to: the host's socket.
         local: SocketAddr,
+        /// The lease in seconds; 0 for a permanent one, where the router allows no other.
         lease: u32,
     },
+    /// By PCP, or NAT-PMP.
     Pcp(PortMapping),
 }
 
 impl Mapping {
+    /// The protocol that made it.
     fn method(&self) -> PortMapMethod {
         match self {
             Mapping::Upnp { .. } => PortMapMethod::Upnp,
@@ -44,6 +52,7 @@ impl Mapping {
         }
     }
 
+    /// The port forwarded.
     fn external_port(&self) -> u16 {
         match self {
             Mapping::Upnp { external_port, .. } => *external_port,
@@ -51,6 +60,7 @@ impl Mapping {
         }
     }
 
+    /// The router's public address, if the protocol tells it.
     async fn external_ip(&self) -> Option<IpAddr> {
         match self {
             Mapping::Upnp { gateway, .. } => gateway.get_external_ip().await.ok(),
@@ -61,6 +71,7 @@ impl Mapping {
         }
     }
 
+    /// Renews the lease.
     async fn renew(&mut self) -> Result<(), String> {
         match self {
             Mapping::Upnp {
@@ -82,6 +93,7 @@ impl Mapping {
         }
     }
 
+    /// Asks the router to remove it.
     async fn remove(self) {
         let method = self.method();
         let result = match self {
@@ -110,6 +122,7 @@ fn default_route() -> Option<(Ipv4Addr, Ipv4Addr)> {
     Some((local, gateway))
 }
 
+/// Asks a UPnP gateway to forward a port to `local`: the same one if free, otherwise any.
 async fn map_upnp(local: SocketAddr) -> Result<Mapping, String> {
     let IpAddr::V4(local_ip) = local.ip() else {
         return Err("UPnP: no IPv4 address".into());
@@ -121,7 +134,7 @@ async fn map_upnp(local: SocketAddr) -> Result<Mapping, String> {
     let gateway = search_gateway(options)
         .await
         .map_err(|e| format!("UPnP: {e}"))?;
-    let mut lease = LEASE.as_secs() as u32;
+    let mut lease = LEASE_SECS;
     let desc = "game_rendezvous";
     // The same external port as the local one if free, otherwise any.
     let mut result = gateway
@@ -133,20 +146,19 @@ async fn map_upnp(local: SocketAddr) -> Result<Mapping, String> {
             .add_port(PortMappingProtocol::UDP, local.port(), local, lease, desc)
             .await;
     }
-    let external_port = match result {
-        Ok(()) => local.port(),
-        Err(_) => {
-            let mut any = gateway
+    let external_port = if result.is_ok() {
+        local.port()
+    } else {
+        let mut any = gateway
+            .add_any_port(PortMappingProtocol::UDP, local, lease, desc)
+            .await;
+        if let Err(AddAnyPortError::OnlyPermanentLeasesSupported) = any {
+            lease = 0;
+            any = gateway
                 .add_any_port(PortMappingProtocol::UDP, local, lease, desc)
                 .await;
-            if let Err(AddAnyPortError::OnlyPermanentLeasesSupported) = any {
-                lease = 0;
-                any = gateway
-                    .add_any_port(PortMappingProtocol::UDP, local, lease, desc)
-                    .await;
-            }
-            any.map_err(|e| format!("UPnP: {e}"))?
         }
+        any.map_err(|e| format!("UPnP: {e}"))?
     };
     Ok(Mapping::Upnp {
         gateway,
@@ -156,11 +168,13 @@ async fn map_upnp(local: SocketAddr) -> Result<Mapping, String> {
     })
 }
 
+/// Asks `gateway` to forward the same port to `local` with PCP, or NAT-PMP if it speaks only
+/// that.
 async fn map_pcp(local: SocketAddr, gateway: Ipv4Addr) -> Result<Mapping, String> {
     let port = NonZeroU16::new(local.port()).ok_or("PCP: port 0")?;
     let options = PortMappingOptions {
         external_port: Some(port),
-        lifetime_seconds: Some(LEASE.as_secs() as u32),
+        lifetime_seconds: Some(LEASE_SECS),
         timeout_config: Some(TimeoutConfig {
             initial_timeout: Duration::from_millis(250),
             max_retries: 3,
@@ -205,7 +219,7 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot
     loop {
         tokio::select! {
             _ = &mut stop => break,
-            () = tokio::time::sleep(LEASE / 2) => {
+            () = tokio::time::sleep(Duration::from_secs(u64::from(LEASE_SECS / 2))) => {
                 let mut renewed = None;
                 let mut errors = Vec::new();
                 for (i, m) in mappings.iter_mut().enumerate() {
@@ -222,12 +236,11 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot
                         lost = false;
                         report(&mappings[i], port, &events).await;
                     }
-                    Some(_) => {}
                     None if !lost => {
                         lost = true;
                         let _ = events.send(PortMapEvent::Lost(errors.join("; ")));
                     }
-                    None => {}
+                    _ => {}
                 }
             }
         }

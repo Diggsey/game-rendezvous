@@ -1,7 +1,7 @@
 //! Joining: asking a host through the relays, then connecting directly.
 //!
 //! As for hosting, the game thread ([`Join`]) runs what needs the socket (the public address,
-//! the connectivity checks), and a task on the worker ([`relay`]) what needs the joiner's key
+//! the connectivity checks), and a task on the worker ([`task`]) what needs the joiner's key
 //! (sealing the request, opening the host's answer).
 
 mod task;
@@ -20,8 +20,8 @@ use crate::handshake::{HANDSHAKE_KIND, Message};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::{GameInfo, PROTOCOL};
 use crate::net::{self, LocalAddr};
-use crate::worker::{self, Command, Inbox, Sink};
 use crate::stun::{self, Gatherer};
+use crate::worker::{self, Command, Inbox, Sink};
 use task::{FromTask, JoinTask, SendRequest};
 
 /// After nomination, how long the checks go on before the socket is handed over, so that the
@@ -59,9 +59,12 @@ pub struct Connection {
     pub received: Vec<Vec<u8>>,
 }
 
+/// Where a join is.
 enum Stage {
-    /// The gatherer starts once the STUN servers' names are resolved.
+    /// Asking STUN servers for the public address. The gatherer starts once the servers'
+    /// names are resolved.
     Gathering(Option<Gatherer>),
+    /// The request is out; waiting for the host's answer.
     WaitingForHost {
         /// When the request went out, then when a relay took it: the host's time to answer
         /// runs from there.
@@ -71,40 +74,60 @@ enum Stage {
         /// Why the copies sent so far were not taken, while none has been.
         relay_errors: Option<String>,
     },
+    /// Running the checks.
     Connecting {
+        /// When the host's answer came.
         since: Instant,
     },
+    /// A path was nominated; the checks go on a moment for the host's side.
     Settling {
+        /// When the path was nominated.
         since: Instant,
+        /// The host's address on it.
         peer: SocketAddr,
     },
+    /// `poll` has returned the outcome.
     Finished,
 }
 
 /// A join in progress: call [`poll`](Join::poll) every frame until it returns the connection
 /// or an error. Dropping it abandons the join.
 pub struct Join {
+    /// The configuration and worker.
     inner: Arc<Inner>,
+    /// The socket, until it is handed over.
     socket: Option<UdpSocket>,
+    /// Tells the host's answer to this attempt from another's.
     attempt: String,
+    /// The player's name, for the host.
     player_name: String,
+    /// This machine's addresses.
     locals: Vec<LocalAddr>,
+    /// The socket's port.
     port: u16,
+    /// Where the join is.
     stage: Stage,
+    /// When the join began.
     started: Instant,
+    /// The host's answers' subscription, closed when the join ends.
     subscription: SubscriptionId,
     /// Dropping it ends the worker task, which repeats the request until the host answers.
     /// `None` once the join has finished.
     to_task: Option<Sink<SendRequest>>,
+    /// The relays' and the host's answers, from the worker task.
     from_task: Inbox<FromTask>,
+    /// The checks with the host, once this side's candidates are known.
     link: Option<Link>,
+    /// The STUN servers saw this side's NAT map each destination to a new port.
     symmetric_nat: bool,
     /// Datagrams that are not the library's, kept for the game: (sender, payload).
     early: Vec<(SocketAddr, Vec<u8>)>,
+    /// Room to read a datagram into.
     buf: Box<[u8]>,
 }
 
 impl Join {
+    /// Starts joining `game` from `socket`, unless the listing already rules it out.
     pub(crate) fn new(
         inner: Arc<Inner>,
         game: &GameInfo,
@@ -170,11 +193,15 @@ impl Join {
         })
     }
 
+    /// How far the join has got, for showing to the player.
+    #[must_use]
     pub fn stage(&self) -> JoinStage {
         match self.stage {
             Stage::Gathering(_) => JoinStage::Gathering,
             Stage::WaitingForHost { .. } => JoinStage::WaitingForHost,
-            _ => JoinStage::Connecting,
+            Stage::Connecting { .. } | Stage::Settling { .. } | Stage::Finished => {
+                JoinStage::Connecting
+            }
         }
     }
 
@@ -196,6 +223,7 @@ impl Join {
         result
     }
 
+    /// One poll's work; `Some` once the join has finished.
     fn step(&mut self, now: Instant) -> Option<Result<Connection, JoinError>> {
         if let Err(e) = self.receive(now) {
             return Some(Err(e));
@@ -206,7 +234,7 @@ impl Join {
         if let Some(link) = &mut self.link {
             link.drive(now, socket);
         }
-        let mut gathered = None;
+        let mut public_addresses = None;
         match &mut self.stage {
             Stage::Gathering(gatherer) => {
                 let deadline = self.started + self.inner.config.gather_timeout;
@@ -224,7 +252,7 @@ impl Join {
                     let reflexive = gatherer.as_ref().map(Gatherer::mapped).unwrap_or_default();
                     self.symmetric_nat = gatherer.as_ref().is_some_and(Gatherer::symmetric_nat);
                     debug!("joiner public addresses: {reflexive:?}");
-                    gathered = Some(reflexive);
+                    public_addresses = Some(reflexive);
                 }
             }
             Stage::WaitingForHost {
@@ -258,7 +286,11 @@ impl Join {
             Stage::Settling { since, peer } => {
                 if now - *since >= SETTLE {
                     // The agent may have nominated a better pair while settling.
-                    let peer = self.link.as_ref().and_then(Link::nominated).unwrap_or(*peer);
+                    let peer = self
+                        .link
+                        .as_ref()
+                        .and_then(Link::nominated)
+                        .unwrap_or(*peer);
                     let socket = self.socket.take()?;
                     let received = std::mem::take(&mut self.early)
                         .into_iter()
@@ -274,16 +306,14 @@ impl Join {
             }
             Stage::Finished => {}
         }
-        if let Some(reflexive) = gathered
-            && let Err(e) = self.send_request(now, reflexive)
-        {
-            return Some(Err(e));
+        if let Some(reflexive) = public_addresses {
+            self.send_request(now, reflexive);
         }
         None
     }
 
     /// Makes the link with the candidates gathered and sends the join request.
-    fn send_request(&mut self, now: Instant, reflexive: Vec<SocketAddr>) -> Result<(), JoinError> {
+    fn send_request(&mut self, now: Instant, reflexive: Vec<SocketAddr>) {
         let candidates = LocalCandidates {
             addrs: self.locals.clone(),
             port: self.port,
@@ -308,7 +338,6 @@ impl Join {
             published: false,
             relay_errors: None,
         };
-        Ok(())
     }
 
     /// Reads the host's answers and every datagram on the socket.

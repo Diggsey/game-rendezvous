@@ -11,10 +11,15 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+/// Bytes 4 to 8 of every STUN message (RFC 8489, section 5).
 const MAGIC_COOKIE: [u8; 4] = 0x2112_A442u32.to_be_bytes();
+/// The message type of a Binding request.
 const BINDING_REQUEST: u16 = 0x0001;
+/// The message type of a Binding success response.
 const BINDING_SUCCESS: u16 = 0x0101;
+/// The MAPPED-ADDRESS attribute, from older servers.
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+/// The XOR-MAPPED-ADDRESS attribute.
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// A STUN transaction id.
@@ -24,6 +29,11 @@ pub(crate) type TransactionId = [u8; 12];
 /// magic cookie in place. A game sharing its socket with this crate should give such datagrams
 /// to [`Host::handle_datagram`](crate::Host::handle_datagram) and make sure its own packets
 /// never look like this.
+///
+/// ```
+/// assert!(!game_rendezvous::is_stun(b"a game's own packet, which starts with a letter"));
+/// ```
+#[must_use]
 pub fn is_stun(data: &[u8]) -> bool {
     data.len() >= 20 && data[0] & 0xc0 == 0 && data[4..8] == MAGIC_COOKIE
 }
@@ -38,6 +48,10 @@ pub(crate) fn binding_request(id: TransactionId) -> [u8; 20] {
 }
 
 /// A Binding success response telling the requester its address, `mapped`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the attribute holds at most 20 bytes"
+)]
 pub(crate) fn binding_success(id: TransactionId, mapped: SocketAddr) -> Vec<u8> {
     let mapped = crate::net::canonical(mapped);
     let mut value = vec![0u8];
@@ -74,7 +88,18 @@ pub(crate) fn respond(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
     Some(binding_success(id, from))
 }
 
-/// Serves STUN Binding requests on `socket` until it fails. For tests and local setups.
+/// Serves STUN Binding requests on `socket`, blocking, until it fails: a STUN server for tests
+/// and private networks, as in the `test_network` example.
+///
+/// ```no_run
+/// let socket = std::net::UdpSocket::bind("127.0.0.1:3478")?;
+/// std::thread::spawn(move || game_rendezvous::stun::serve(&socket));
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// When reading the socket fails (other than for an ICMP "port unreachable").
 pub fn serve(socket: &UdpSocket) -> std::io::Result<()> {
     let mut buf = [0u8; 1500];
     loop {
@@ -164,21 +189,26 @@ const STRAGGLERS: Duration = Duration::from_millis(400);
 /// returns from the socket being studied and feeds every reply to [`handle`](Self::handle).
 #[derive(Debug)]
 pub(crate) struct Gatherer {
+    /// When gathering began: resends are timed from it.
     started: Instant,
+    /// When gathering gives up on the servers that have not answered.
     deadline: Instant,
     /// Requests out, by transaction id.
     pending: HashMap<TransactionId, SocketAddr>,
+    /// The servers asked.
     servers: Vec<SocketAddr>,
+    /// How many of [`RESENDS`] have gone out.
     resends_done: usize,
     /// Each answering server and the address it saw.
     answers: Vec<(SocketAddr, SocketAddr)>,
+    /// When the first server answered.
     first_answer: Option<Instant>,
 }
 
 impl Gatherer {
     /// Gathers from `servers` (already resolved) for at most `timeout`. Servers of a family the
     /// socket cannot reach should be left out.
-    pub fn new(servers: Vec<SocketAddr>, now: Instant, timeout: Duration) -> Self {
+    pub(crate) fn new(servers: Vec<SocketAddr>, now: Instant, timeout: Duration) -> Self {
         Gatherer {
             started: now,
             deadline: now + timeout,
@@ -192,7 +222,7 @@ impl Gatherer {
 
     /// Gathers for `socket` from those of `servers` (already resolved) it can reach, for at
     /// most `timeout`.
-    pub fn for_socket(
+    pub(crate) fn for_socket(
         socket: &UdpSocket,
         servers: Vec<SocketAddr>,
         now: Instant,
@@ -207,14 +237,14 @@ impl Gatherer {
     }
 
     /// Sends the requests due by `now` from `socket`.
-    pub fn send_due(&mut self, now: Instant, socket: &UdpSocket) {
+    pub(crate) fn send_due(&mut self, now: Instant, socket: &UdpSocket) {
         for (server, request) in self.poll_transmit(now) {
             let _ = crate::net::send_to(socket, &request, server);
         }
     }
 
     /// The requests due by `now`, as (server, datagram).
-    pub fn poll_transmit(&mut self, now: Instant) -> Vec<(SocketAddr, [u8; 20])> {
+    pub(crate) fn poll_transmit(&mut self, now: Instant) -> Vec<(SocketAddr, [u8; 20])> {
         let mut out = Vec::new();
         if self.is_done(now) {
             return out;
@@ -235,7 +265,7 @@ impl Gatherer {
     }
 
     /// Takes a datagram if it answers one of this gatherer's requests.
-    pub fn handle(&mut self, now: Instant, data: &[u8]) -> bool {
+    pub(crate) fn handle(&mut self, now: Instant, data: &[u8]) -> bool {
         let Some((id, mapped)) = parse_binding_success(data) else {
             return false;
         };
@@ -250,14 +280,14 @@ impl Gatherer {
     }
 
     /// Every server has answered, or the time is up.
-    pub fn is_done(&self, now: Instant) -> bool {
+    pub(crate) fn is_done(&self, now: Instant) -> bool {
         self.answers.len() == self.servers.len()
             || now >= self.deadline
             || self.first_answer.is_some_and(|t| now >= t + STRAGGLERS)
     }
 
     /// The distinct addresses the servers saw.
-    pub fn mapped(&self) -> Vec<SocketAddr> {
+    pub(crate) fn mapped(&self) -> Vec<SocketAddr> {
         let mut out: Vec<SocketAddr> = Vec::new();
         for (_, a) in &self.answers {
             if !out.contains(a) {
@@ -269,7 +299,7 @@ impl Gatherer {
 
     /// Whether different servers saw different IPv4 ports: the NAT maps each destination to a
     /// new port ("symmetric"), which defeats hole punching unless the other side is open.
-    pub fn symmetric_nat(&self) -> bool {
+    pub(crate) fn symmetric_nat(&self) -> bool {
         let mut ports = self
             .answers
             .iter()

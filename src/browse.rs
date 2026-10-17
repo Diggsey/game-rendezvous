@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use nostr_sdk::prelude::{Event, Filter, SubscriptionId, Timestamp};
 
-use crate::{Inner, RelayCount};
 use crate::listing::{GameId, GameInfo, LISTING_KIND, Parsed, listing_tag, parse_listing};
 use crate::worker::{Command, Inbox};
+use crate::{Inner, RelayCount};
 
 /// How far back to ask relays for listings. Live ones are refreshed far more often; expired
 /// ones are dropped anyway.
@@ -23,13 +23,18 @@ const MAX_GAMES: usize = 500;
 /// The games advertised online. Poll it every frame (or so) while the list is shown; drop it
 /// to stop listening.
 pub struct Browser {
+    /// The configuration and worker.
     inner: Arc<Inner>,
+    /// The listings' subscription, closed on drop.
     subscription: SubscriptionId,
+    /// Listing events from the relays.
     events: Inbox<Event>,
+    /// The games heard of.
     games: Games,
 }
 
 impl Browser {
+    /// Subscribes to this game id's listings.
     pub(crate) fn new(inner: Arc<Inner>) -> Browser {
         let filter = Filter::new()
             .kind(LISTING_KIND)
@@ -64,11 +69,13 @@ impl Browser {
     }
 
     /// The games found: joinable ones first, then ones not taking players, then other versions.
+    #[must_use]
     pub fn games(&self) -> &[GameInfo] {
         &self.games.sorted
     }
 
     /// How many relays are connected, of how many configured.
+    #[must_use]
     pub fn relays(&self) -> RelayCount {
         self.inner.relays()
     }
@@ -88,12 +95,14 @@ struct Entry {
     game: Option<GameInfo>,
     /// When the listing was made, to tell a newer copy from an older one.
     created_at: Timestamp,
+    /// When to forget it.
     expires: SystemTime,
 }
 
 /// The games heard of, by id.
 #[derive(Default)]
 struct Games {
+    /// Every game's latest listing.
     found: HashMap<GameId, Entry>,
     /// The open games, sorted for showing.
     sorted: Vec<GameInfo>,
@@ -138,16 +147,14 @@ impl Games {
         self.open_count() != open
     }
 
+    /// How many games are open.
     fn open_count(&self) -> usize {
         self.found.values().filter(|e| e.game.is_some()).count()
     }
 
+    /// Sorts the open games into `sorted`.
     fn sort(&mut self) {
-        self.sorted = self
-            .found
-            .values()
-            .filter_map(|e| e.game.clone())
-            .collect();
+        self.sorted = self.found.values().filter_map(|e| e.game.clone()).collect();
         // Joinable games first, then those of this version that are not taking players, then
         // other versions; by name within each, the id keeping the order stable.
         let key = |g: &GameInfo| (!g.compatible, !g.joinable, g.name.to_lowercase(), g.id);

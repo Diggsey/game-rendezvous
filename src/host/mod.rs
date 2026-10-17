@@ -2,7 +2,7 @@
 //!
 //! The work is split between two threads. The game thread ([`Host`]) owns what needs the
 //! game's socket: learning the public address and the connectivity checks. The worker
-//! ([`relay`]) owns what needs the host's keys: the listing, and reading and answering join
+//! ([`task`]) owns what needs the host's keys: the listing, and reading and answering join
 //! requests. They exchange plain data.
 
 mod task;
@@ -17,15 +17,15 @@ use nostr_sdk::prelude::{Filter, Keys, PublicKey, SubscriptionId};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::{Inner, RelayCount};
 use crate::handshake::{HANDSHAKE_KIND, RefuseReason};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::Listing;
 use crate::net::{self, LocalAddr};
 use crate::portmap::{PortMapEvent, PortMapMethod};
-use crate::worker::{self, Command, Inbox, Published, Sink};
 use crate::stun::{self, Gatherer};
-use task::{FromTask, JoinRequest, HostTask, ToTask};
+use crate::worker::{self, Command, Inbox, Published, Sink};
+use crate::{Inner, RelayCount};
+use task::{FromTask, HostTask, JoinRequest, ToTask};
 
 /// How long a connected joiner's checks are still answered, for its retransmissions.
 const LINGER: Duration = Duration::from_secs(5);
@@ -43,17 +43,33 @@ const SILENT_JOINER: Duration = Duration::from_secs(6);
 #[non_exhaustive]
 pub enum HostEvent {
     /// The listing reached this many relays (reported when that changes).
-    Listed { relays: usize },
-    /// No relay took the listing.
+    Listed {
+        /// How many relays took the latest copy.
+        relays: usize,
+    },
+    /// No relay took the listing; why, per relay.
     ListingFailed(String),
     /// The router was (or could not be) asked to open the port.
     PortMapping(PortMapEvent),
     /// A player was refused, e.g. for running an incompatible version.
-    JoinRefused { name: String, reason: RefuseReason },
+    JoinRefused {
+        /// The player's name, as they sent it (cut short, without control characters).
+        name: String,
+        /// Why; the player was told.
+        reason: RefuseReason,
+    },
     /// A player's connection works: game traffic from `addr` is theirs.
-    PeerConnected { addr: SocketAddr, name: String },
-    /// A player's connectivity checks all failed.
-    PeerFailed { name: String },
+    PeerConnected {
+        /// The player's address, [`canonical`](crate::canonical).
+        addr: SocketAddr,
+        /// The player's name, as they sent it (cut short, without control characters).
+        name: String,
+    },
+    /// A player's connectivity checks all failed, or they never sent one.
+    PeerFailed {
+        /// The player's name.
+        name: String,
+    },
 }
 
 /// A summary of the host's reachability, for showing to the player.
@@ -72,9 +88,13 @@ pub struct HostStatus {
 
 /// A joiner in the middle of connecting.
 struct Joiner {
+    /// The player's name.
     name: String,
+    /// The checks with them.
     link: Link,
+    /// When the host accepted them.
     started: Instant,
+    /// When their path was nominated.
     connected_at: Option<Instant>,
     /// A check (or answer) came from the joiner.
     heard: bool,
@@ -84,37 +104,54 @@ struct Joiner {
 /// own to [`handle_datagram`](Host::handle_datagram); it calls [`poll`](Host::poll) every frame.
 /// Dropping the host closes the listing and the router's port mapping.
 pub struct Host {
+    /// The configuration and worker.
     inner: Arc<Inner>,
     /// A clone of the game's socket, for sending.
     socket: UdpSocket,
+    /// When hosting began.
     started: Instant,
 
+    /// The listing as the game last set it.
     listing: Listing,
     /// Dropping it ends the worker task, which closes the listing.
     to_task: Sink<ToTask>,
+    /// Join requests and refusals from the worker task.
     from_task: Inbox<FromTask>,
+    /// How the relays took each copy of the listing.
     published: Inbox<Published>,
+    /// Relays that took the latest copy.
     listed_on: usize,
 
+    /// This machine's addresses.
     locals: Vec<LocalAddr>,
+    /// The socket's port.
     port: u16,
+    /// Asking STUN servers for the public address, when under way.
     gatherer: Option<Gatherer>,
+    /// When asking last finished.
     last_gather: Option<Instant>,
+    /// The public addresses STUN servers saw.
     reflexive: Vec<SocketAddr>,
+    /// What the router said about the port mapping.
     port_events: Inbox<PortMapEvent>,
     /// The router's public address (if it said), port and mapping protocol.
     port_mapping: Option<(Option<IpAddr>, u16, PortMapMethod)>,
     /// Dropping it removes the port mapping.
     _port_mapping_stop: Option<oneshot::Sender<()>>,
 
+    /// The join requests' subscription, closed on drop.
     subscription: SubscriptionId,
     /// Requests that came before the public address was known.
     early_requests: Vec<JoinRequest>,
+    /// Joiners being connected, by their attempt's key.
     joiners: HashMap<PublicKey, Joiner>,
+    /// Events not yet polled.
     events: VecDeque<HostEvent>,
 }
 
 impl Host {
+    /// Starts hosting on a clone of `socket`: the listing, its worker task, and the port
+    /// mapping.
     pub(crate) fn new(inner: Arc<Inner>, socket: &UdpSocket, listing: Listing) -> io::Result<Host> {
         let socket = socket.try_clone()?;
         let keys = Keys::generate();
@@ -122,9 +159,7 @@ impl Host {
         let locals = net::local_addrs(&socket, inner.config.local_addresses.as_deref());
         // No `since`: nothing can be addressed to a key made just now, and a `since` from this
         // clock would hide the requests of a joiner whose clock is behind.
-        let filter = Filter::new()
-            .kind(HANDSHAKE_KIND)
-            .pubkey(keys.public_key());
+        let filter = Filter::new().kind(HANDSHAKE_KIND).pubkey(keys.public_key());
         let (subscription, requests) = inner.worker.subscribe(filter);
         let (port_tx, port_events) = worker::channel();
         let stop = if inner.config.port_mapping {
@@ -228,10 +263,14 @@ impl Host {
         }
     }
 
+    /// The listing as last set.
+    #[must_use]
     pub fn listing(&self) -> &Listing {
         &self.listing
     }
 
+    /// How reachable the host is, for showing to the player.
+    #[must_use]
     pub fn status(&self) -> HostStatus {
         HostStatus {
             relays: self.inner.relays(),
@@ -272,6 +311,7 @@ impl Host {
         }
     }
 
+    /// Takes in what the router said about the port mapping.
     fn port_mapping_events(&mut self) {
         while let Ok(e) = self.port_events.try_recv() {
             match &e {
@@ -291,10 +331,16 @@ impl Host {
     fn mapped_address(&self) -> Option<(SocketAddr, PortMapMethod)> {
         let (ip, port, method) = self.port_mapping?;
         // NAT-PMP does not say the public address; STUN does.
-        let ip = ip.or_else(|| self.reflexive.iter().find(|a| a.is_ipv4()).map(|a| a.ip()))?;
+        let ip = ip.or_else(|| {
+            self.reflexive
+                .iter()
+                .find(|a| a.is_ipv4())
+                .map(SocketAddr::ip)
+        })?;
         Some((SocketAddr::new(ip, port), method))
     }
 
+    /// The addresses to offer joiners.
     fn candidates(&self) -> LocalCandidates {
         let mut reflexive = self.reflexive.clone();
         if let Some((addr, _)) = self.mapped_address()
@@ -344,6 +390,7 @@ impl Host {
         }
     }
 
+    /// Accepts `r`: answers with the host's side of the checks, and starts them.
     fn join_request(&mut self, now: Instant, r: JoinRequest) {
         let mut link = Link::new(false, &self.candidates());
         link.set_remote(&r.ice);
@@ -369,6 +416,7 @@ impl Host {
         );
     }
 
+    /// Runs the joiners' checks, and lets go of those connected or failed.
     fn drive_joiners(&mut self, now: Instant) {
         let timeout = self.inner.config.connect_timeout + Duration::from_secs(5);
         let mut done = Vec::new();

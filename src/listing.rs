@@ -39,11 +39,25 @@ pub(crate) fn clean(text: &str, max: usize) -> String {
 }
 
 /// What a host advertises about its game. `metadata` is the game's own (mode, map, ...).
+///
+/// The default is an unnamed, empty game that takes players:
+///
+/// ```
+/// use game_rendezvous::Listing;
+///
+/// let mut listing = Listing { name: "Ann's game".into(), players: 1, max_players: 4, ..Listing::default() };
+/// listing.metadata.insert("mode".into(), "capture the flag".into());
+/// ```
+///
+/// Browsers show at most 64 characters of the name, and 32 metadata entries of at most 64
+/// characters a key and 256 a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     /// The game's name as players see it, e.g. the host's player name.
     pub name: String,
+    /// Players in the game now.
     pub players: u32,
+    /// Players the game takes at most.
     pub max_players: u32,
     /// Whether players can join now. A game whose match is under way (or that is full) can
     /// stay listed with this off: browsers show it as not joinable, and the host refuses
@@ -65,7 +79,8 @@ impl Default for Listing {
     }
 }
 
-/// Identifies an advertised game: the public key its host signs with.
+/// Identifies an advertised game: the public key its host signs with, made for that one game.
+/// It displays as its first 12 hex digits, enough to tell games apart in a log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GameId(pub(crate) PublicKey);
 
@@ -77,20 +92,25 @@ impl fmt::Display for GameId {
 }
 
 /// A game found on the relays.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GameInfo {
+    /// Which game it is, whatever its name.
     pub id: GameId,
+    /// The game's name as its host advertises it ([`Listing::name`]).
     pub name: String,
     /// The host's game version.
     pub version: String,
     /// Whether this build can join it; incompatible games are listed so that players know an
     /// update exists, but cannot be joined.
     pub compatible: bool,
+    /// Players in the game ([`Listing::players`]).
     pub players: u32,
+    /// Players the game takes at most ([`Listing::max_players`]).
     pub max_players: u32,
     /// Whether the host takes players now (see [`Listing::joinable`]).
     pub joinable: bool,
+    /// The game's own key-values ([`Listing::metadata`]).
     pub metadata: BTreeMap<String, String>,
     /// When the host last refreshed the listing (the host's clock).
     pub updated: SystemTime,
@@ -101,14 +121,20 @@ pub struct GameInfo {
 /// A listing's event content.
 #[derive(Serialize, Deserialize)]
 struct Content {
+    /// The listing and handshake protocol ([`PROTOCOL`]).
     protocol: u32,
+    /// [`Listing::name`].
     name: String,
+    /// The host's game version.
     version: String,
+    /// [`Listing::players`].
     players: u32,
+    /// [`Listing::max_players`].
     max_players: u32,
     /// Listings from before this field are joinable.
     #[serde(default = "yes")]
     joinable: bool,
+    /// [`Listing::metadata`].
     #[serde(default)]
     metadata: BTreeMap<String, String>,
     /// A tombstone: the game has closed.
@@ -116,6 +142,7 @@ struct Content {
     closed: bool,
 }
 
+/// `true`, for serde's defaults.
 fn yes() -> bool {
     true
 }
@@ -169,7 +196,12 @@ pub(crate) enum Parsed {
     /// A game taking (or not taking) players.
     Open(GameInfo),
     /// A closed game's tombstone, until it expires.
-    Closed { id: GameId, expires: SystemTime },
+    Closed {
+        /// The game that closed.
+        id: GameId,
+        /// When the tombstone may be forgotten.
+        expires: SystemTime,
+    },
 }
 
 /// The largest listing content read, in bytes; real ones are a few hundred.
@@ -221,6 +253,7 @@ pub(crate) fn parse_listing(config: &Config, event: &Event) -> Option<Parsed> {
     }))
 }
 
+/// A Nostr timestamp as a `SystemTime`.
 fn to_system_time(t: Timestamp) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(t.as_secs())
 }
@@ -263,7 +296,10 @@ mod tests {
         let event = listing_event(&config, &keys, &listing, false, None).unwrap();
         let game = open(parse_listing(&config, &event));
         assert_eq!(game.id, GameId(keys.public_key()));
-        assert_eq!((game.name.as_str(), game.version.as_str()), ("Ann's game", "1.0"));
+        assert_eq!(
+            (game.name.as_str(), game.version.as_str()),
+            ("Ann's game", "1.0")
+        );
         assert_eq!((game.players, game.max_players), (2, 4));
         assert!(game.compatible && game.joinable);
         assert_eq!(game.metadata, listing.metadata);
@@ -299,7 +335,10 @@ mod tests {
             "protocol": PROTOCOL, "name": "Forever", "version": "1.0",
             "players": 1, "max_players": 2,
         });
-        let game = open(parse_listing(&config(), &event(&content, 100 * 365 * 24 * 3600)));
+        let game = open(parse_listing(
+            &config(),
+            &event(&content, 100 * 365 * 24 * 3600),
+        ));
         let left = game.expires.duration_since(SystemTime::now()).unwrap();
         assert!(left <= MAX_TTL, "{left:?}");
     }

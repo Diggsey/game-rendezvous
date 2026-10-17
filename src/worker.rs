@@ -42,6 +42,7 @@ pub(crate) type Sink<T> = tmpsc::UnboundedSender<T>;
 /// `Sync`, so the types holding one can live in an engine's shared resources.
 pub(crate) type Inbox<T> = tmpsc::UnboundedReceiver<T>;
 
+/// A channel between the worker and the game side.
 pub(crate) fn channel<T>() -> (Sink<T>, Inbox<T>) {
     tmpsc::unbounded_channel()
 }
@@ -50,42 +51,56 @@ pub(crate) fn channel<T>() -> (Sink<T>, Inbox<T>) {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Published {
     /// Relays that accepted the event.
-    pub accepted: usize,
+    pub(crate) accepted: usize,
     /// Why the others did not.
-    pub errors: Vec<String>,
+    pub(crate) errors: Vec<String>,
 }
 
+/// What the game side asks the worker to do.
 pub(crate) enum Command {
+    /// Subscribes to `filter` on every relay, sending the events to `events`.
     Subscribe {
+        /// The subscription's id, to close it with.
         id: SubscriptionId,
+        /// What to subscribe to.
         filter: Filter,
+        /// Where the events go, once each.
         events: Sink<Event>,
     },
+    /// Closes a subscription.
     Unsubscribe(SubscriptionId),
+    /// Asks the router to forward `port`, until `stop` fires or is dropped.
     MapPort {
+        /// The host's port.
         port: u16,
+        /// What the router said.
         events: Sink<PortMapEvent>,
+        /// Fires (or is dropped) when the host stops.
         stop: oneshot::Receiver<()>,
     },
     /// Runs a task on the worker. Shutting down waits for it (briefly), so a task can still
     /// publish a last event once its owner has gone.
     Spawn(Box<dyn FnOnce(TaskContext) -> TaskFuture + Send>),
+    /// Stops the worker: the last handle has gone.
     Shutdown,
 }
 
+/// A task run on the worker.
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// What a task on the worker can use: the relay client, directly (the worker's command loop
 /// stops at shutdown, while its tasks get a moment to finish).
 #[derive(Clone)]
 pub(crate) struct TaskContext {
+    /// The relay client.
     client: Client,
+    /// What the worker shares with the game side.
     shared: Arc<Shared>,
 }
 
 impl TaskContext {
     /// Publishes `event`, waiting for the relays' answers.
-    pub async fn publish(&self, event: &Event) -> Published {
+    pub(crate) async fn publish(&self, event: &Event) -> Published {
         publish(&self.client, &self.shared, event).await
     }
 
@@ -94,7 +109,7 @@ impl TaskContext {
     ///
     /// Each call seals afresh, so a repeat is a new event: relays (and subscribers) drop one
     /// they have already seen.
-    pub fn send_sealed(
+    pub(crate) fn send_sealed(
         &self,
         keys: &Keys,
         to: &PublicKey,
@@ -109,7 +124,7 @@ impl TaskContext {
     }
 
     /// Publishes `event` in the background; its outcome goes to `done`, if given.
-    pub fn publish_in_background(&self, event: Event, done: Option<Sink<Published>>) {
+    pub(crate) fn publish_in_background(&self, event: Event, done: Option<Sink<Published>>) {
         let ctx = self.clone();
         tokio::spawn(async move {
             let outcome = ctx.publish(&event).await;
@@ -123,23 +138,31 @@ impl TaskContext {
 /// State the worker shares with the game side.
 #[derive(Default)]
 pub(crate) struct Shared {
-    pub relays_connected: AtomicUsize,
+    /// Relays connected, as of the last status tick.
+    pub(crate) relays_connected: AtomicUsize,
     /// The STUN servers' addresses, once resolved.
-    pub stun_servers: Mutex<Option<Vec<SocketAddr>>>,
+    pub(crate) stun_servers: Mutex<Option<Vec<SocketAddr>>>,
 }
 
 /// A handle on the worker; cheap to clone. The worker shuts down when the last handle goes,
 /// after sending what is already queued.
 #[derive(Clone)]
 pub(crate) struct Worker {
+    /// Commands to the worker.
     commands: tmpsc::UnboundedSender<Command>,
-    pub shared: Arc<Shared>,
+    /// What the worker shares with the game side.
+    shared: Arc<Shared>,
+    /// Stops the thread when the last handle goes.
     _thread: Arc<WorkerThread>,
 }
 
+/// The worker's thread, which it stops when dropped.
 struct WorkerThread {
+    /// Commands to the worker, for the last one: `Shutdown`.
     commands: tmpsc::UnboundedSender<Command>,
+    /// The thread, to join.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Told when the worker has finished.
     finished: Mutex<mpsc::Receiver<()>>,
 }
 
@@ -161,7 +184,7 @@ impl Drop for WorkerThread {
 
 impl Worker {
     /// Starts the worker, connecting to `relays` and resolving `stun_servers`.
-    pub fn start(relays: Vec<String>, stun_servers: Vec<String>) -> std::io::Result<Worker> {
+    pub(crate) fn start(relays: Vec<String>, stun_servers: Vec<String>) -> std::io::Result<Worker> {
         let (tx, rx) = tmpsc::unbounded_channel();
         let shared = Arc::new(Shared::default());
         let (finished_tx, finished) = mpsc::channel();
@@ -189,12 +212,13 @@ impl Worker {
         })
     }
 
-    pub fn send(&self, c: Command) {
+    /// Sends the worker a command (nothing happens if it has stopped).
+    pub(crate) fn send(&self, c: Command) {
         let _ = self.commands.send(c);
     }
 
     /// Runs `task` on the worker.
-    pub fn spawn<F, Fut>(&self, task: F)
+    pub(crate) fn spawn<F, Fut>(&self, task: F)
     where
         F: FnOnce(TaskContext) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -203,7 +227,7 @@ impl Worker {
     }
 
     /// Events matching `filter` from now on (and stored ones), until `Unsubscribe(id)`.
-    pub fn subscribe(&self, filter: Filter) -> (SubscriptionId, Inbox<Event>) {
+    pub(crate) fn subscribe(&self, filter: Filter) -> (SubscriptionId, Inbox<Event>) {
         let id = SubscriptionId::generate();
         let (tx, rx) = channel();
         self.send(Command::Subscribe {
@@ -214,16 +238,19 @@ impl Worker {
         (id, rx)
     }
 
-    pub fn relays_connected(&self) -> usize {
+    /// Relays connected now.
+    pub(crate) fn relays_connected(&self) -> usize {
         self.shared.relays_connected.load(Ordering::Relaxed)
     }
 
     /// The resolved STUN servers; `None` while still resolving.
-    pub fn stun_servers(&self) -> Option<Vec<SocketAddr>> {
+    pub(crate) fn stun_servers(&self) -> Option<Vec<SocketAddr>> {
         self.shared.stun_servers.lock().unwrap().clone()
     }
 }
 
+/// The worker: connects to `relays`, looks `stun_servers` up, and carries out `commands`
+/// until told to stop.
 async fn run(
     relays: Vec<String>,
     stun_servers: Vec<String>,
@@ -336,7 +363,9 @@ async fn run(
 /// force by sending junk).
 #[derive(Default)]
 struct Seen {
+    /// The newer generation, filling up.
     current: HashSet<(SubscriptionId, EventId)>,
+    /// The older generation, forgotten when the newer is full.
     previous: HashSet<(SubscriptionId, EventId)>,
 }
 
@@ -356,6 +385,7 @@ impl Seen {
     }
 }
 
+/// How many relays `client` is connected to.
 async fn count_connected(client: &Client) -> usize {
     client
         .relays()
@@ -365,6 +395,8 @@ async fn count_connected(client: &Client) -> usize {
         .count()
 }
 
+/// Publishes `event` to every relay, waiting (a little) for a first connection and for the
+/// relays' answers.
 async fn publish(client: &Client, shared: &Shared, event: &Event) -> Published {
     // Right after start no relay is connected yet; give them a moment. The worker's status
     // tick keeps the count current.
@@ -416,7 +448,8 @@ async fn resolve_stun(servers: Vec<String>, shared: Arc<Shared>) {
 /// Looks the STUN servers up, all at once.
 async fn lookup_stun(servers: &[String]) -> Vec<SocketAddr> {
     let mut lookups = JoinSet::new();
-    for server in servers.iter().cloned() {
+    for server in servers {
+        let server = server.clone();
         lookups.spawn(async move {
             let lookup = tokio::net::lookup_host(server.as_str());
             match tokio::time::timeout(Duration::from_secs(5), lookup).await {

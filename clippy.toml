@@ -1,0 +1,2 @@
+# Words the docs use that are not code.
+doc-valid-idents = ["UPnP", "NAT-PMP", "IPv4", "IPv6", "WebRTC", ".."]

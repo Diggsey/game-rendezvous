@@ -37,8 +37,11 @@ pub(super) enum ToTask {
     SetListing(Listing),
     /// Accept a joiner the task passed on, with the host's side of the checks.
     Accept {
+        /// The joiner's key.
         to: PublicKey,
+        /// The joiner's attempt.
         attempt: String,
+        /// The host's side of the checks.
         ice: IceParams,
     },
     /// The game is done with a joiner (connected, or failed): it no longer counts as joining.
@@ -47,10 +50,14 @@ pub(super) enum ToTask {
 
 /// A join request the task accepted.
 pub(super) struct JoinRequest {
-    pub from: PublicKey,
-    pub attempt: String,
-    pub player_name: String,
-    pub ice: IceParams,
+    /// The joiner's key for this attempt.
+    pub(super) from: PublicKey,
+    /// The attempt, to answer.
+    pub(super) attempt: String,
+    /// The player's name, cleaned.
+    pub(super) player_name: String,
+    /// The joiner's side of the checks.
+    pub(super) ice: IceParams,
 }
 
 /// To the game thread.
@@ -58,7 +65,12 @@ pub(super) enum FromTask {
     /// A request to connect: the game runs the checks and answers with [`ToTask::Accept`].
     Request(JoinRequest),
     /// A player the task refused (already answered).
-    Refused { name: String, reason: RefuseReason },
+    Refused {
+        /// The player's name, cleaned.
+        name: String,
+        /// Why.
+        reason: RefuseReason,
+    },
 }
 
 /// A joiner between its request and the game being done with it. Each join attempt signs with
@@ -66,23 +78,33 @@ pub(super) enum FromTask {
 struct Active {
     /// The accept, once the game has made it: sent again if the joiner repeats its request.
     accept: Option<Message>,
+    /// When the accept last went out.
     last_sent: Option<Instant>,
 }
 
+/// The host's task on the worker: see the module documentation.
 pub(super) struct HostTask {
-    pub ctx: TaskContext,
-    pub config: Config,
-    pub keys: Keys,
-    pub listing: Listing,
-    pub commands: Inbox<ToTask>,
-    pub requests: Inbox<Event>,
-    pub notices: Sink<FromTask>,
-    pub published: Sink<Published>,
+    /// The worker's relay client.
+    pub(super) ctx: TaskContext,
+    /// The game's configuration.
+    pub(super) config: Config,
+    /// The game's key, which signs the listing and the handshake.
+    pub(super) keys: Keys,
+    /// The listing as the game last set it.
+    pub(super) listing: Listing,
+    /// From the game thread; closed when the host is dropped.
+    pub(super) commands: Inbox<ToTask>,
+    /// Handshake events addressed to the host.
+    pub(super) requests: Inbox<Event>,
+    /// To the game thread.
+    pub(super) notices: Sink<FromTask>,
+    /// How the relays took each copy of the listing, to the game thread.
+    pub(super) published: Sink<Published>,
 }
 
 impl HostTask {
     /// Runs until the game drops its end, then replaces the listing with a tombstone.
-    pub async fn run(mut self) {
+    pub(super) async fn run(mut self) {
         let mut state = State {
             listing_changed: true,
             last_publish: None,
@@ -100,7 +122,7 @@ impl HostTask {
                     Some(c) => self.command(&mut state, c),
                 },
                 Some(event) = self.requests.recv() => self.request(&mut state, &event),
-                _ = tokio::time::sleep_until(due.into()) => self.publish_listing(&mut state),
+                () = tokio::time::sleep_until(due.into()) => self.publish_listing(&mut state),
             }
         }
         // Browsers drop the game now rather than at the listing's expiry.
@@ -117,6 +139,7 @@ impl HostTask {
         }
     }
 
+    /// Carries out what the game thread asks.
     fn command(&mut self, state: &mut State, command: ToTask) {
         match command {
             ToTask::SetListing(l) => {
@@ -141,25 +164,24 @@ impl HostTask {
         }
     }
 
+    /// Publishes the listing as it stands.
     fn publish_listing(&mut self, state: &mut State) {
         let previous = state.last_created;
-        match listing_event(&self.config, &self.keys, &self.listing, false, previous) {
-            Some(event) => {
-                state.last_created = Some(event.created_at);
-                state.last_publish = Some(Instant::now());
-                state.listing_changed = false;
-                self.ctx
-                    .publish_in_background(event, Some(self.published.clone()));
-            }
-            None => {
-                warn!("could not sign the listing");
-                // Try again at the next refresh, not in a tight loop.
-                state.last_publish = Some(Instant::now());
-                state.listing_changed = false;
-            }
+        // Whether or not it can be signed, it is next published at the refresh, not in a
+        // tight loop.
+        state.last_publish = Some(Instant::now());
+        state.listing_changed = false;
+        if let Some(event) = listing_event(&self.config, &self.keys, &self.listing, false, previous)
+        {
+            state.last_created = Some(event.created_at);
+            self.ctx
+                .publish_in_background(event, Some(self.published.clone()));
+        } else {
+            warn!("could not sign the listing");
         }
     }
 
+    /// Reads a handshake event: a join request, or one repeated.
     fn request(&mut self, state: &mut State, event: &Event) {
         let from = event.pubkey;
         // A joiner repeating its request (each attempt has its own key): answer again, unread.
@@ -248,15 +270,21 @@ impl HostTask {
     }
 }
 
+/// What the task keeps track of.
 struct State {
+    /// The listing changed since it was last published.
     listing_changed: bool,
+    /// When the listing was last published.
     last_publish: Option<Instant>,
     /// The date of the last listing published: each copy must be dated after the last.
     last_created: Option<Timestamp>,
+    /// Joiners between their request and the game being done with them.
     active: HashMap<PublicKey, Active>,
     /// Joiners the game is done with, and when.
     finished: HashMap<PublicKey, Instant>,
+    /// Handshake messages decrypted a second.
     budget: RateBudget,
+    /// Refusals published a second.
     refusals: RateBudget,
 }
 

@@ -27,8 +27,22 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 /// Decides whether a game of version `theirs` can play with this game, of version `ours`.
 pub type CompatibilityFn = dyn Fn(&str, &str) -> bool + Send + Sync;
 
-/// The library's configuration. [`Config::new`] gives the defaults for public play; the fields
-/// are public for tests and special setups.
+/// The library's configuration. [`Config::new`] gives the defaults for public play; change
+/// fields after that for tests and special setups.
+///
+/// ```
+/// use std::time::Duration;
+/// use game_rendezvous::Config;
+///
+/// let mut config = Config::new("my-game", "1.2.0").with_compatibility(|ours, theirs| {
+///     // Any 1.2.x plays with any other.
+///     let minor = |v: &str| v.rsplit_once('.').map(|(minor, _)| minor.to_owned());
+///     minor(ours) == minor(theirs)
+/// });
+/// config.port_mapping = false;
+/// config.connect_timeout = Duration::from_secs(15);
+/// assert!(config.is_compatible("1.2.7"));
+/// ```
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct Config {
@@ -43,15 +57,18 @@ pub struct Config {
     /// STUN servers, as `host:port`.
     pub stun_servers: Vec<String>,
     /// Whether a host asks its router to open its port (UPnP IGD, NAT-PMP, PCP). Without the
-    /// `port-mapping` feature, a host only reports [`PortMapEvent::Failed`](crate::PortMapEvent).
+    /// `port-mapping` feature, a host only reports
+    /// [`PortMapEvent::Failed`](crate::PortMapEvent::Failed).
     pub port_mapping: bool,
     /// The addresses to offer peers instead of this machine's own, e.g. `127.0.0.1` in tests.
     /// `None` uses every LAN and global IPv6 address of the machine.
     pub local_addresses: Option<Vec<IpAddr>>,
-    /// Version compatibility; exact equality by default.
+    /// Version compatibility, as `compatible(ours, theirs)`; exact equality by default (see
+    /// [`with_compatibility`](Self::with_compatibility)).
     pub compatible: Arc<CompatibilityFn>,
     /// How long a listing lives on the relays without being refreshed. A host that vanishes
-    /// without closing its listing disappears from the lists after this.
+    /// without closing its listing disappears from the lists after this. Browsers believe at
+    /// most an hour of a listing's life, or their own `listing_ttl` if longer.
     pub listing_ttl: Duration,
     /// How often a host republishes its listing (well within `listing_ttl`).
     pub listing_refresh: Duration,
@@ -71,12 +88,16 @@ pub struct Config {
 impl Config {
     /// The configuration for a game: its id and version, with the default relays and STUN
     /// servers, port mapping on, and exact version matching.
+    #[must_use]
     pub fn new(game_id: impl Into<String>, game_version: impl Into<String>) -> Self {
         Config {
             game_id: game_id.into(),
             game_version: game_version.into(),
-            relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
-            stun_servers: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+            relays: DEFAULT_RELAYS.iter().map(ToString::to_string).collect(),
+            stun_servers: DEFAULT_STUN_SERVERS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             port_mapping: true,
             local_addresses: None,
             compatible: Arc::new(|ours, theirs| ours == theirs),
@@ -90,12 +111,14 @@ impl Config {
     }
 
     /// Uses these relays instead of the default ones.
+    #[must_use]
     pub fn with_relays<I: IntoIterator<Item = S>, S: Into<String>>(mut self, relays: I) -> Self {
         self.relays = relays.into_iter().map(Into::into).collect();
         self
     }
 
     /// Uses these STUN servers instead of the default ones.
+    #[must_use]
     pub fn with_stun_servers<I: IntoIterator<Item = S>, S: Into<String>>(
         mut self,
         servers: I,
@@ -106,6 +129,7 @@ impl Config {
 
     /// Decides version compatibility with `f(ours, theirs)` instead of exact equality. Both the
     /// joiner and the host apply their own rule; either can refuse.
+    #[must_use]
     pub fn with_compatibility(
         mut self,
         f: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
@@ -115,6 +139,7 @@ impl Config {
     }
 
     /// Whether a game of version `theirs` can play with this one.
+    #[must_use]
     pub fn is_compatible(&self, theirs: &str) -> bool {
         (self.compatible)(&self.game_version, theirs)
     }

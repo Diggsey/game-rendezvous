@@ -1,5 +1,5 @@
 //! Asking the router to forward a host's port (UPnP IGD, NAT-PMP or PCP): what a host hears of
-//! it. The asking is in [`router`], with the `port-mapping` feature.
+//! it. The asking is in `router`, with the `port-mapping` feature.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -40,8 +40,11 @@ pub enum PortMapEvent {
     /// The router forwards `external_port` to the host's socket. `external_ip` is the router's
     /// public address when the protocol tells it.
     Mapped {
+        /// The router's public address, if the protocol says (NAT-PMP does not).
         external_ip: Option<IpAddr>,
+        /// The port the router forwards.
         external_port: u16,
+        /// The protocol that asked.
         method: PortMapMethod,
     },
     /// No router opened the port; the reasons per method.
@@ -60,6 +63,7 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, stop: oneshot::Re
 
 /// Without the `port-mapping` feature: reports that no port was mapped.
 #[cfg(not(feature = "port-mapping"))]
+#[allow(clippy::unused_async, reason = "the worker runs it as a task")]
 pub(crate) async fn run(_port: u16, events: Sink<PortMapEvent>, _stop: oneshot::Receiver<()>) {
     let why = "built without port mapping (the `port-mapping` feature)";
     let _ = events.send(PortMapEvent::Failed(why.into()));
@@ -71,10 +75,14 @@ mod tests {
 
     #[test]
     fn methods_print_as_their_usual_names() {
-        let names: Vec<String> = [PortMapMethod::Upnp, PortMapMethod::NatPmp, PortMapMethod::Pcp]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let names: Vec<String> = [
+            PortMapMethod::Upnp,
+            PortMapMethod::NatPmp,
+            PortMapMethod::Pcp,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
         assert_eq!(names, ["UPnP", "NAT-PMP", "PCP"]);
     }
 }

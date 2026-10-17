@@ -45,15 +45,19 @@ impl LocalCandidates {
 
 /// One side of a connection attempt.
 pub(crate) struct Link {
+    /// The ICE agent, which knows both sides' candidates and runs the checks.
     agent: IceAgent,
+    /// This machine's addresses, to guess which one a check arrived on.
     locals: Vec<LocalAddr>,
+    /// The socket's port.
     port: u16,
+    /// The peer's address on the nominated pair, once there is one.
     nominated: Option<SocketAddr>,
 }
 
 impl Link {
     /// A link offering `locals`. The joiner is `controlling`: it picks the pair.
-    pub fn new(controlling: bool, locals: &LocalCandidates) -> Link {
+    pub(crate) fn new(controlling: bool, locals: &LocalCandidates) -> Link {
         let mut agent = IceAgent::new(IceCreds::new());
         agent.set_controlling(controlling);
         agent.set_control_tie_breaker(rand::random());
@@ -86,7 +90,7 @@ impl Link {
     }
 
     /// The credentials and candidates to send to the other side.
-    pub fn params(&self) -> IceParams {
+    pub(crate) fn params(&self) -> IceParams {
         let creds = self.agent.local_credentials();
         IceParams {
             ufrag: creds.ufrag.clone(),
@@ -100,12 +104,12 @@ impl Link {
     }
 
     /// How many remote candidates were offered.
-    pub fn remote_candidates(&self) -> usize {
+    pub(crate) fn remote_candidates(&self) -> usize {
         self.agent.remote_candidates().count()
     }
 
     /// Takes the other side's credentials and candidates; checks start.
-    pub fn set_remote(&mut self, params: &IceParams) {
+    pub(crate) fn set_remote(&mut self, params: &IceParams) {
         self.agent.set_remote_credentials(IceCreds {
             ufrag: params.ufrag.clone(),
             pass: params.pwd.clone(),
@@ -121,12 +125,16 @@ impl Link {
     }
 
     /// Whether this link's agent takes `msg` (a check for it, or an answer to its own).
-    pub fn accepts(&self, msg: &StunMessage<'_>) -> bool {
+    pub(crate) fn accepts(&self, msg: &StunMessage<'_>) -> bool {
         self.agent.accepts_message(msg)
     }
 
     /// Feeds a STUN message received from `from`.
-    pub fn handle(&mut self, now: Instant, from: SocketAddr, msg: StunMessage<'_>) {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the agent takes the message by value"
+    )]
+    pub(crate) fn handle(&mut self, now: Instant, from: SocketAddr, msg: StunMessage<'_>) {
         let from = net::canonical(from);
         let Some(dest) = net::guess_destination(&self.locals, from.ip()) else {
             return;
@@ -143,7 +151,7 @@ impl Link {
     }
 
     /// Runs the agent's timers and sends its checks from `socket`.
-    pub fn drive(&mut self, now: Instant, socket: &UdpSocket) {
+    pub(crate) fn drive(&mut self, now: Instant, socket: &UdpSocket) {
         self.agent.handle_timeout(now);
         while let Some(t) = self.agent.poll_transmit() {
             trace!("ICE {} -> {}", t.source, t.destination);
@@ -160,7 +168,7 @@ impl Link {
     }
 
     /// The peer's address on the nominated pair, once there is one.
-    pub fn nominated(&self) -> Option<SocketAddr> {
+    pub(crate) fn nominated(&self) -> Option<SocketAddr> {
         self.nominated
     }
 }
