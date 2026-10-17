@@ -7,7 +7,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 /// Binds a non-blocking UDP socket on `port` (0 for any) that reaches both IPv4 and IPv6 peers.
 ///
@@ -61,9 +61,37 @@ pub fn send_to(socket: &UdpSocket, data: &[u8], to: SocketAddr) -> io::Result<us
     socket.send_to(data, for_socket(socket, to))
 }
 
-/// Whether `socket` can reach IPv6 peers.
-pub(crate) fn is_dual_stack(socket: &UdpSocket) -> bool {
-    matches!(socket.local_addr(), Ok(SocketAddr::V6(_)))
+/// The address families a socket can reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Families {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+impl Families {
+    /// What `socket` reaches: IPv4 for an IPv4 socket; IPv6 for an IPv6 one, and IPv4 too
+    /// unless `IPV6_V6ONLY` is on (as it is by default on Windows for std's `[::]` sockets).
+    pub fn of(socket: &UdpSocket) -> Families {
+        match socket.local_addr() {
+            Ok(SocketAddr::V4(_)) => Families { v4: true, v6: false },
+            Ok(SocketAddr::V6(_)) => {
+                let only_v6 = SockRef::from(socket).only_v6().unwrap_or(false);
+                Families {
+                    v4: !only_v6,
+                    v6: true,
+                }
+            }
+            Err(_) => Families {
+                v4: false,
+                v6: false,
+            },
+        }
+    }
+
+    /// Whether the socket reaches `ip`.
+    pub fn reaches(self, ip: IpAddr) -> bool {
+        if ip.is_ipv4() { self.v4 } else { self.v6 }
+    }
 }
 
 /// One of this machine's addresses, with its network's prefix length.
@@ -92,8 +120,8 @@ pub(crate) fn local_addrs(socket: &UdpSocket, only: Option<&[IpAddr]>) -> Vec<Lo
             default: true,
         }];
     }
-    let v6 = is_dual_stack(socket);
-    let usable = |ip: &IpAddr| ip.is_ipv4() || v6;
+    let families = Families::of(socket);
+    let usable = |ip: &IpAddr| families.reaches(*ip);
     if let Some(only) = only {
         return only
             .iter()
@@ -112,7 +140,7 @@ pub(crate) fn local_addrs(socket: &UdpSocket, only: Option<&[IpAddr]>) -> Vec<Lo
             continue;
         }
         let default = Some(iface.index) == default_index;
-        for net in &iface.ipv4 {
+        for net in iface.ipv4.iter().filter(|_| families.v4) {
             let ip = net.addr();
             if !ip.is_link_local() && !ip.is_unspecified() {
                 addrs.push(LocalAddr {
@@ -122,7 +150,7 @@ pub(crate) fn local_addrs(socket: &UdpSocket, only: Option<&[IpAddr]>) -> Vec<Lo
                 });
             }
         }
-        if !v6 {
+        if !families.v6 {
             continue;
         }
         for (i, net) in iface.ipv6.iter().enumerate() {
@@ -208,6 +236,23 @@ mod tests {
         let (n, from) = b.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hi");
         assert_eq!(from.port(), a.local_addr().unwrap().port());
+    }
+
+    #[test]
+    fn families_follow_the_v6_only_option() {
+        let dual = bind_dual_stack(0).unwrap();
+        if matches!(dual.local_addr().unwrap(), SocketAddr::V6(_)) {
+            assert_eq!(Families::of(&dual), Families { v4: true, v6: true });
+            let v6_only = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            v6_only.set_only_v6(true).unwrap();
+            v6_only
+                .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+                .unwrap();
+            let v6_only: UdpSocket = v6_only.into();
+            assert_eq!(Families::of(&v6_only), Families { v4: false, v6: true });
+        }
+        let v4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(Families::of(&v4), Families { v4: true, v6: false });
     }
 
     #[test]

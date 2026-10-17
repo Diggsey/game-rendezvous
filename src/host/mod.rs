@@ -252,10 +252,10 @@ impl Host {
             let Some(servers) = self.inner.signal.stun_servers() else {
                 return; // still resolving
             };
-            let dual = net::is_dual_stack(&self.socket);
+            let families = net::Families::of(&self.socket);
             let servers = servers
                 .into_iter()
-                .filter(|s| s.is_ipv4() || dual)
+                .filter(|s| families.reaches(s.ip()))
                 .collect();
             self.gatherer = Some(Gatherer::new(
                 servers,

@@ -211,10 +211,10 @@ impl Join {
                 if gatherer.is_none()
                     && let Some(servers) = self.inner.signal.stun_servers()
                 {
-                    let dual = net::is_dual_stack(socket);
+                    let families = net::Families::of(socket);
                     let servers = servers
                         .into_iter()
-                        .filter(|s| s.is_ipv4() || dual)
+                        .filter(|s| families.reaches(s.ip()))
                         .collect();
                     let left = deadline.saturating_duration_since(now);
                     *gatherer = Some(Gatherer::new(servers, now, left));
