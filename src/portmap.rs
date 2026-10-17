@@ -55,6 +55,9 @@ pub enum PortMapEvent {
     },
     /// No router opened the port; the reasons per method.
     Failed(String),
+    /// The router stopped forwarding the port: renewing every mapping failed, for these
+    /// reasons. A later renewal that works reports [`Mapped`](PortMapEvent::Mapped) again.
+    Lost(String),
 }
 
 enum Mapping {
@@ -215,8 +218,6 @@ async fn map_pcp(local: SocketAddr, gateway: Ipv4Addr) -> Result<Mapping, String
 
 /// Maps `port` on the router, reports to `events`, renews the mapping until `stop` fires (or
 /// its sender is dropped), then removes it.
-/// Maps `port` on the router, reports to `events`, renews the mapping until `stop` fires (or
-/// its sender is dropped), then removes it.
 pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot::Receiver<()>) {
     let Some((local_ip, gateway)) = tokio::task::spawn_blocking(default_route)
         .await
@@ -237,14 +238,33 @@ pub(crate) async fn run(port: u16, events: Sink<PortMapEvent>, mut stop: oneshot
         }
     };
     report(&mappings[0], port, &events).await;
+    let mut lost = false;
     loop {
         tokio::select! {
             _ = &mut stop => break,
             () = tokio::time::sleep(LEASE / 2) => {
-                for m in &mut mappings {
-                    if let Err(e) = m.renew().await {
-                        debug!("could not renew the {} port mapping: {e}", m.method());
+                let mut renewed = None;
+                let mut errors = Vec::new();
+                for (i, m) in mappings.iter_mut().enumerate() {
+                    match m.renew().await {
+                        Ok(()) => { renewed.get_or_insert(i); }
+                        Err(e) => {
+                            debug!("could not renew the {} port mapping: {e}", m.method());
+                            errors.push(format!("{}: {e}", m.method()));
+                        }
                     }
+                }
+                match renewed {
+                    Some(i) if lost => {
+                        lost = false;
+                        report(&mappings[i], port, &events).await;
+                    }
+                    Some(_) => {}
+                    None if !lost => {
+                        lost = true;
+                        let _ = events.send(PortMapEvent::Lost(errors.join("; ")));
+                    }
+                    None => {}
                 }
             }
         }

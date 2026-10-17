@@ -274,13 +274,14 @@ impl Host {
 
     fn port_mapping_events(&mut self) {
         while let Ok(e) = self.port_events.try_recv() {
-            if let PortMapEvent::Mapped {
-                external_ip,
-                external_port,
-                method,
-            } = &e
-            {
-                self.port_mapping = Some((*external_ip, *external_port, *method));
+            match &e {
+                PortMapEvent::Mapped {
+                    external_ip,
+                    external_port,
+                    method,
+                } => self.port_mapping = Some((*external_ip, *external_port, *method)),
+                PortMapEvent::Lost(_) => self.port_mapping = None,
+                PortMapEvent::Failed(_) => {}
             }
             self.events.push_back(HostEvent::PortMapping(e));
         }
