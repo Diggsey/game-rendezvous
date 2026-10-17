@@ -30,6 +30,7 @@ pub type CompatibilityFn = dyn Fn(&str, &str) -> bool + Send + Sync;
 /// The library's configuration. [`Config::new`] gives the defaults for public play; the fields
 /// are public for tests and special setups.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Identifies the game among all games using this library, e.g. `"stick-suicide-2"`.
     /// Only games with the same id see each other.

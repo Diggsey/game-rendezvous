@@ -47,6 +47,7 @@ pub(crate) enum Message {
 /// Why a host refused a join request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RefuseReason {
     /// The host's version does not accept the joiner's.
     IncompatibleVersion { host_version: String },

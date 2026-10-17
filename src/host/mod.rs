@@ -40,6 +40,7 @@ const SILENT_JOINER: Duration = Duration::from_secs(6);
 
 /// What happened while hosting, from [`Host::poll`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostEvent {
     /// The listing reached this many relays (reported when that changes).
     Listed { relays: usize },
@@ -57,6 +58,7 @@ pub enum HostEvent {
 
 /// A summary of the host's reachability, for showing to the player.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HostStatus {
     /// Relays connected, of how many configured.
     pub relays: RelayCount,

@@ -108,6 +108,7 @@ fn assert_send_sync() {
 /// How many of the configured relays are connected, from [`Rendezvous::relays`] and the
 /// like.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct RelayCount {
     /// Relays connected now.
     pub connected: usize,

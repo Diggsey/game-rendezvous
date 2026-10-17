@@ -78,6 +78,7 @@ impl fmt::Display for GameId {
 
 /// A game found on the relays.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct GameInfo {
     pub id: GameId,
     pub name: String,

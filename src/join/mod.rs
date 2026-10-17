@@ -34,6 +34,7 @@ const RECV_BUFFER: usize = 65_536;
 
 /// How far a join has got, for showing to the player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinStage {
     /// Asking STUN servers for this side's public address.
     Gathering,
@@ -45,6 +46,7 @@ pub enum JoinStage {
 
 /// A working connection to a host: send to `peer` from `socket`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Connection {
     /// The socket the checks succeeded on, non-blocking. Dual-stack sockets need
     /// [`send_to`](crate::send_to) for IPv4 peers and report them through

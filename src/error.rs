@@ -5,6 +5,7 @@ use crate::handshake::RefuseReason;
 
 /// Why joining a game failed. `Display` gives a message fit to show the player.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum JoinError {
     /// The game runs a version this build cannot play with (decided locally from the listing).
     IncompatibleVersion { ours: String, theirs: String },

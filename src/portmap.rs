@@ -24,6 +24,7 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The protocol a router was asked to forward a port with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PortMapMethod {
     /// UPnP Internet Gateway Device.
     Upnp,
@@ -45,6 +46,7 @@ impl fmt::Display for PortMapMethod {
 
 /// A port mapping made (or not) for a host.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PortMapEvent {
     /// The router forwards `external_port` to the host's socket. `external_ip` is the router's
     /// public address when the protocol tells it.
