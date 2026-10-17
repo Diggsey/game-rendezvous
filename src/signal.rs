@@ -99,7 +99,6 @@ impl TaskContext {
 #[derive(Default)]
 pub(crate) struct Shared {
     pub relays_connected: AtomicUsize,
-    pub relays_total: AtomicUsize,
     /// The STUN servers' addresses, once resolved.
     pub stun_servers: Mutex<Option<Vec<SocketAddr>>>,
 }
@@ -140,7 +139,6 @@ impl Signal {
     pub fn start(relays: Vec<String>, stun_servers: Vec<String>) -> std::io::Result<Signal> {
         let (tx, rx) = tmpsc::unbounded_channel();
         let shared = Arc::new(Shared::default());
-        shared.relays_total.store(relays.len(), Ordering::Relaxed);
         let (finished_tx, finished) = mpsc::channel();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
