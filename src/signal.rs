@@ -213,6 +213,10 @@ async fn run(
     let mut tasks = JoinSet::new();
     tasks.spawn(resolve_stun(stun_servers, shared.clone()));
     let mut sinks: HashMap<SubscriptionId, Sink<Event>> = HashMap::new();
+    // Subscriptions still being sent to the relays. Each runs in a task of its own, so an
+    // unsubscribe waits for its subscribe: run first, it would close nothing, and the
+    // subscription would then stay open on the relays.
+    let mut subscribing: HashMap<SubscriptionId, oneshot::Receiver<()>> = HashMap::new();
     // Each relay sends its own copy of an event; subscribers get one.
     let mut seen = Seen::default();
     let mut status_tick = tokio::time::interval(Duration::from_millis(250));
@@ -222,17 +226,24 @@ async fn run(
                 None | Some(Command::Shutdown) => break,
                 Some(Command::Subscribe { id, filter, events }) => {
                     sinks.insert(id.clone(), events);
+                    let (subscribed, done) = oneshot::channel();
+                    subscribing.insert(id.clone(), done);
                     let client = client.clone();
                     tasks.spawn(async move {
                         if let Err(e) = client.subscribe(filter).with_id(id).await {
                             warn!("subscribe: {e}");
                         }
+                        let _ = subscribed.send(());
                     });
                 }
                 Some(Command::Unsubscribe(id)) => {
                     sinks.remove(&id);
+                    let subscribed = subscribing.remove(&id);
                     let client = client.clone();
                     tasks.spawn(async move {
+                        if let Some(subscribed) = subscribed {
+                            let _ = subscribed.await;
+                        }
                         let _ = client.unsubscribe(&id).await;
                     });
                 }
