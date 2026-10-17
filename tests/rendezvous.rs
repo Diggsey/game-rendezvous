@@ -171,7 +171,7 @@ fn join_connects_on_localhost() {
     let reply = wait_for(WAIT, "the host's datagram", || {
         // The host's last checks may still arrive; skip them.
         match conn.socket.recv_from(&mut buf) {
-            Ok((n, _)) if !game_rendezvous::stun::is_stun(&buf[..n]) => Some(buf[..n].to_vec()),
+            Ok((n, _)) if !game_rendezvous::is_stun(&buf[..n]) => Some(buf[..n].to_vec()),
             _ => None,
         }
     });
@@ -384,7 +384,7 @@ fn the_hosts_first_datagram_reaches_the_joiner() {
         host.frame();
         greet(&mut host, &mut greeted);
         while let Ok((n, _)) = conn.socket.recv_from(&mut buf) {
-            if !game_rendezvous::stun::is_stun(&buf[..n]) {
+            if !game_rendezvous::is_stun(&buf[..n]) {
                 got.push(buf[..n].to_vec());
             }
         }

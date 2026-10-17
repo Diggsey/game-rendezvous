@@ -1,8 +1,11 @@
-//! The little of STUN (RFC 8489) needed to learn a socket's public address: Binding requests
-//! to public STUN servers and their responses, plus a responder for tests and local servers.
+//! STUN, as far as a game needs it: telling the library's datagrams from the game's own
+//! ([`is_stun`], also at the crate root), and a STUN server for private test networks
+//! ([`serve`]).
 //!
-//! ICE's own connectivity checks are STUN too, but with credentials; the `is` crate handles
-//! those. A server's Binding response carries no credentials, which `is` refuses, hence this.
+//! Inside, the little of STUN (RFC 8489) needed to learn a socket's public address: Binding
+//! requests to public STUN servers and their responses. ICE's own connectivity checks are STUN
+//! too, but with credentials; the `is` crate handles those. A server's Binding response
+//! carries no credentials, which `is` refuses, hence this.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -15,7 +18,7 @@ const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// A STUN transaction id.
-pub type TransactionId = [u8; 12];
+pub(crate) type TransactionId = [u8; 12];
 
 /// Whether `data` looks like a STUN message (of any kind): the first two bits zero and the
 /// magic cookie in place. A game sharing its socket with this crate should give such datagrams
@@ -26,7 +29,7 @@ pub fn is_stun(data: &[u8]) -> bool {
 }
 
 /// A Binding request with no attributes.
-pub fn binding_request(id: TransactionId) -> [u8; 20] {
+pub(crate) fn binding_request(id: TransactionId) -> [u8; 20] {
     let mut msg = [0u8; 20];
     msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
     msg[4..8].copy_from_slice(&MAGIC_COOKIE);
@@ -35,7 +38,7 @@ pub fn binding_request(id: TransactionId) -> [u8; 20] {
 }
 
 /// A Binding success response telling the requester its address, `mapped`.
-pub fn binding_success(id: TransactionId, mapped: SocketAddr) -> Vec<u8> {
+pub(crate) fn binding_success(id: TransactionId, mapped: SocketAddr) -> Vec<u8> {
     let mapped = crate::net::canonical(mapped);
     let mut value = vec![0u8];
     let port = mapped.port() ^ u16::from_be_bytes([MAGIC_COOKIE[0], MAGIC_COOKIE[1]]);
@@ -63,7 +66,7 @@ pub fn binding_success(id: TransactionId, mapped: SocketAddr) -> Vec<u8> {
 }
 
 /// Answers a Binding request from `from` as a STUN server would; `None` for anything else.
-pub fn respond(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+pub(crate) fn respond(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
     if !is_stun(request) || u16::from_be_bytes([request[0], request[1]]) != BINDING_REQUEST {
         return None;
     }
@@ -88,7 +91,7 @@ pub fn serve(socket: &UdpSocket) -> std::io::Result<()> {
 }
 
 /// The transaction id and mapped address of a Binding success response.
-pub fn parse_binding_success(data: &[u8]) -> Option<(TransactionId, SocketAddr)> {
+pub(crate) fn parse_binding_success(data: &[u8]) -> Option<(TransactionId, SocketAddr)> {
     if !is_stun(data) || u16::from_be_bytes([data[0], data[1]]) != BINDING_SUCCESS {
         return None;
     }

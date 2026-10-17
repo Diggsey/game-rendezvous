@@ -91,6 +91,7 @@ pub use join::{Connection, Join, JoinStage};
 pub use listing::{GameId, GameInfo, Listing};
 pub use net::{bind_dual_stack, canonical, for_socket, send_to};
 pub use portmap::{PortMapEvent, PortMapMethod};
+pub use stun::is_stun;
 
 use worker::Worker;
 
