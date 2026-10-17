@@ -4,6 +4,7 @@
 //! host runs and removed when it stops; its lease is short, so a host that crashes leaves a
 //! mapping behind for minutes at most (unless the router only allows permanent UPnP leases).
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::time::Duration;
@@ -21,6 +22,27 @@ const LEASE: Duration = Duration::from_secs(600);
 /// How long to look for a gateway.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The protocol a router was asked to forward a port with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PortMapMethod {
+    /// UPnP Internet Gateway Device.
+    Upnp,
+    /// NAT Port Mapping Protocol (RFC 6886).
+    NatPmp,
+    /// Port Control Protocol (RFC 6887).
+    Pcp,
+}
+
+impl fmt::Display for PortMapMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PortMapMethod::Upnp => "UPnP",
+            PortMapMethod::NatPmp => "NAT-PMP",
+            PortMapMethod::Pcp => "PCP",
+        })
+    }
+}
+
 /// A port mapping made (or not) for a host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PortMapEvent {
@@ -29,7 +51,7 @@ pub enum PortMapEvent {
     Mapped {
         external_ip: Option<IpAddr>,
         external_port: u16,
-        method: &'static str,
+        method: PortMapMethod,
     },
     /// No router opened the port; the reasons per method.
     Failed(String),
@@ -46,12 +68,12 @@ enum Mapping {
 }
 
 impl Mapping {
-    fn method(&self) -> &'static str {
+    fn method(&self) -> PortMapMethod {
         match self {
-            Mapping::Upnp { .. } => "UPnP",
+            Mapping::Upnp { .. } => PortMapMethod::Upnp,
             Mapping::Pcp(m) => match m.mapping_type() {
-                PortMappingType::NatPmp => "NAT-PMP",
-                PortMappingType::Pcp { .. } => "PCP",
+                PortMappingType::NatPmp => PortMapMethod::NatPmp,
+                PortMappingType::Pcp { .. } => PortMapMethod::Pcp,
             },
         }
     }

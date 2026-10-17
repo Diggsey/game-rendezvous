@@ -90,7 +90,7 @@ pub use host::{Host, HostEvent, HostStatus};
 pub use join::{Connection, Join, JoinStage};
 pub use listing::{GameId, GameInfo, Listing};
 pub use net::{bind_dual_stack, canonical, for_socket, send_to};
-pub use portmap::PortMapEvent;
+pub use portmap::{PortMapEvent, PortMapMethod};
 
 use signal::Signal;
 

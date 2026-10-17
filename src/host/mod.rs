@@ -22,7 +22,7 @@ use crate::handshake::{HANDSHAKE_KIND, RefuseReason};
 use crate::ice::{self, Link, LocalCandidates};
 use crate::listing::Listing;
 use crate::net::{self, LocalAddr};
-use crate::portmap::PortMapEvent;
+use crate::portmap::{PortMapEvent, PortMapMethod};
 use crate::signal::{self, Command, Inbox, Published, Sink};
 use crate::stun::{self, Gatherer};
 use relay::{FromRelay, JoinRequest, Relay, ToRelay};
@@ -58,7 +58,7 @@ pub struct HostStatus {
     /// Relays that took the latest listing.
     pub listed_on: usize,
     /// The router's forwarded address and the protocol that opened it.
-    pub port_mapping: Option<(SocketAddr, &'static str)>,
+    pub port_mapping: Option<(SocketAddr, PortMapMethod)>,
     /// The public addresses STUN servers saw.
     pub public_addresses: Vec<SocketAddr>,
 }
@@ -94,7 +94,7 @@ pub struct Host {
     reflexive: Vec<SocketAddr>,
     port_events: Inbox<PortMapEvent>,
     /// The router's public address (if it said), port and mapping protocol.
-    port_mapping: Option<(Option<IpAddr>, u16, &'static str)>,
+    port_mapping: Option<(Option<IpAddr>, u16, PortMapMethod)>,
     /// Dropping it removes the port mapping.
     _port_mapping_stop: Option<oneshot::Sender<()>>,
 
@@ -280,14 +280,14 @@ impl Host {
                 method,
             } = &e
             {
-                self.port_mapping = Some((*external_ip, *external_port, method));
+                self.port_mapping = Some((*external_ip, *external_port, *method));
             }
             self.events.push_back(HostEvent::PortMapping(e));
         }
     }
 
     /// The router's forwarded address and the protocol that opened it.
-    fn mapped_address(&self) -> Option<(SocketAddr, &'static str)> {
+    fn mapped_address(&self) -> Option<(SocketAddr, PortMapMethod)> {
         let (ip, port, method) = self.port_mapping?;
         // NAT-PMP does not say the public address; STUN does.
         let ip = ip.or_else(|| self.reflexive.iter().find(|a| a.is_ipv4()).map(|a| a.ip()))?;
