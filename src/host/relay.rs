@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::Config;
 use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
-use crate::listing::{Listing, PROTOCOL, listing_event};
+use crate::listing::{Listing, MAX_NAME, MAX_VERSION, PROTOCOL, clean, listing_event};
 use crate::signal::{Inbox, Published, Sink, TaskContext};
 
 /// Joiners being connected at once; more are told to wait.
@@ -207,6 +207,8 @@ impl Relay {
             debug!("ignoring a join request for another game");
             return;
         }
+        let player_name = clean(&player_name, MAX_NAME);
+        let version = clean(&version, MAX_VERSION);
         let refusal = if protocol != PROTOCOL || !self.config.is_compatible(&version) {
             Some(RefuseReason::IncompatibleVersion {
                 host_version: self.config.game_version.clone(),
