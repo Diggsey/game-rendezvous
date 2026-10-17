@@ -59,6 +59,8 @@ enum Stage {
         since: Instant,
         /// A relay took the request.
         published: bool,
+        /// Why the copies sent so far were not taken, while none has been.
+        relay_errors: Option<String>,
     },
     Connecting {
         since: Instant,
@@ -218,15 +220,20 @@ impl Join {
                     gathered = Some(reflexive);
                 }
             }
-            Stage::WaitingForHost { since, published } => {
+            Stage::WaitingForHost {
+                since,
+                published,
+                relay_errors,
+            } => {
                 let timeout = self.inner.config.handshake_timeout;
                 if *published && now - *since > timeout {
                     return Some(Err(JoinError::HostNotResponding));
                 }
                 if !*published && now - *since > timeout * 2 {
-                    return Some(Err(JoinError::RelaysUnavailable(
-                        "no relay answered".into(),
-                    )));
+                    let why = relay_errors
+                        .take()
+                        .unwrap_or_else(|| "no relay answered".into());
+                    return Some(Err(JoinError::RelaysUnavailable(why)));
                 }
             }
             Stage::Connecting { since } => {
@@ -282,6 +289,7 @@ impl Join {
         self.stage = Stage::WaitingForHost {
             since: now,
             published: false,
+            relay_errors: None,
         };
         Ok(())
     }
@@ -291,12 +299,26 @@ impl Join {
         while let Ok(notice) = self.from_relay.try_recv() {
             match notice {
                 FromRelay::Published(p) => {
-                    if p.accepted == 0 {
-                        return Err(JoinError::RelaysUnavailable(p.errors.join("; ")));
-                    }
-                    if let Stage::WaitingForHost { since, published } = &mut self.stage {
-                        *since = now;
-                        *published = true;
+                    let Stage::WaitingForHost {
+                        since,
+                        published,
+                        relay_errors,
+                    } = &mut self.stage
+                    else {
+                        continue;
+                    };
+                    if p.accepted > 0 {
+                        // The host's time to answer runs from the first copy a relay took.
+                        if !*published {
+                            *since = now;
+                            *published = true;
+                        }
+                    } else if !*published {
+                        // With no relay connected, no repeat will do better.
+                        if self.inner.signal.relays_connected() == 0 {
+                            return Err(JoinError::RelaysUnavailable(p.errors.join("; ")));
+                        }
+                        *relay_errors = Some(p.errors.join("; "));
                     }
                 }
                 FromRelay::Accepted(ice) => {

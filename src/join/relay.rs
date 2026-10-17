@@ -19,7 +19,7 @@ pub(super) struct SendRequest(pub Message);
 
 /// To the game thread.
 pub(super) enum FromRelay {
-    /// How the relays took the first copy of the request.
+    /// How the relays took a copy of the request: each copy is reported until one is taken.
     Published(Published),
     /// The host accepted: its side of the checks.
     Accepted(IceParams),
@@ -51,21 +51,28 @@ impl Relay {
             return;
         };
         let (published_tx, mut published) = crate::signal::channel();
-        self.ctx.publish_in_background(event, Some(published_tx));
+        self.ctx
+            .publish_in_background(event, Some(published_tx.clone()));
+        // Until a relay takes a copy, the game hears how each one went.
+        let mut taken = false;
         let mut budget = DecryptBudget::new(self.handshake_rate);
         let mut repeat = tokio::time::interval(REQUEST_INTERVAL);
         repeat.tick().await; // the first tick is immediate: the request has just gone out
         loop {
             tokio::select! {
-                // The game dropped the join.
+                // The game dropped the join, or it finished.
                 None = self.commands.recv() => return,
                 Some(p) = published.recv() => {
-                    let _ = self.notices.send(FromRelay::Published(p));
+                    if !taken {
+                        taken = p.accepted > 0;
+                        let _ = self.notices.send(FromRelay::Published(p));
+                    }
                 }
                 // Sealed afresh: relays (and subscribers) drop an event they have already seen.
                 _ = repeat.tick() => {
                     if let Some(event) = handshake::seal(&self.keys, &self.host, &request) {
-                        self.ctx.publish_in_background(event, None);
+                        let done = (!taken).then(|| published_tx.clone());
+                        self.ctx.publish_in_background(event, done);
                     }
                 }
                 Some(reply) = self.replies.recv() => {
