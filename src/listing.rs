@@ -165,26 +165,37 @@ pub(crate) fn listing_event(
 
 /// What a browser makes of a listing event.
 pub(crate) enum Parsed {
+    /// A game taking (or not taking) players.
     Open(GameInfo),
-    Closed(GameId),
+    /// A closed game's tombstone, until it expires.
+    Closed { id: GameId, expires: SystemTime },
 }
+
+/// The largest listing content read, in bytes; real ones are a few hundred.
+const MAX_CONTENT: usize = 4096;
+/// The longest a listing is believed to live, whatever its expiration says (unless this
+/// game's own listings live longer): a stranger's listing must not stay in the lists for good.
+const MAX_TTL: Duration = Duration::from_secs(3600);
 
 /// Reads a listing event, judging its compatibility by `config`. `None` if it is malformed,
 /// for another game, or expired.
 pub(crate) fn parse_listing(config: &Config, event: &Event) -> Option<Parsed> {
     if event.kind != LISTING_KIND
+        || event.content.len() > MAX_CONTENT
         || event.tags.identifier().as_deref() != Some(listing_tag(&config.game_id).as_str())
     {
         return None;
     }
-    let expires = event.tags.expiration()?;
+    let max_ttl = MAX_TTL.max(config.listing_ttl).as_secs();
+    let expires = event.tags.expiration()?.min(event.created_at + max_ttl);
     if expires <= Timestamp::now() {
         return None;
     }
+    let expires = to_system_time(expires);
     let id = GameId(event.pubkey);
     let content: Content = serde_json::from_str(&event.content).ok()?;
     if content.closed {
-        return Some(Parsed::Closed(id));
+        return Some(Parsed::Closed { id, expires });
     }
     let version = clean(&content.version, MAX_VERSION);
     let compatible = content.protocol == PROTOCOL && config.is_compatible(&version);
@@ -205,7 +216,7 @@ pub(crate) fn parse_listing(config: &Config, event: &Event) -> Option<Parsed> {
         joinable: content.joinable,
         metadata,
         updated: to_system_time(event.created_at),
-        expires: to_system_time(expires),
+        expires,
     }))
 }
 
@@ -258,30 +269,49 @@ mod tests {
 
         let closed = listing_event(&config, &keys, &listing, true, Some(event.created_at)).unwrap();
         assert!(closed.created_at > event.created_at);
-        assert!(matches!(parse_listing(&config, &closed), Some(Parsed::Closed(id)) if id == game.id));
+        assert!(matches!(
+            parse_listing(&config, &closed),
+            Some(Parsed::Closed { id, .. }) if id == game.id
+        ));
     }
 
     #[test]
     fn hostile_text_is_cut_short_and_cleaned() {
-        let metadata: serde_json::Map<_, _> = (0..100)
-            .map(|i| (format!("key {i}"), "v".repeat(1000).into()))
-            .collect();
+        let mut metadata: serde_json::Map<_, _> =
+            (0..40).map(|i| (format!("k{i:02}"), "v".into())).collect();
+        metadata.insert("a long one".into(), "v".repeat(300).into());
         let content = serde_json::json!({
-            "protocol": PROTOCOL, "name": format!("Evil\u{1b}[2J{}", "x".repeat(1000)),
+            "protocol": PROTOCOL, "name": format!("Evil\u{1b}[2J{}", "x".repeat(100)),
             "version": "1.0", "players": 1, "max_players": 2, "metadata": metadata,
         });
         let game = open(parse_listing(&config(), &event(&content, 60)));
         assert_eq!(game.name.chars().count(), MAX_NAME);
         assert!(game.name.starts_with("Evil[2J"));
-        let (entries, key_len, value_len) = MAX_METADATA;
+        let (entries, _, value_len) = MAX_METADATA;
         assert_eq!(game.metadata.len(), entries);
-        assert!(game.metadata.iter().all(|(k, v)| k.len() <= key_len && v.len() == value_len));
+        assert_eq!(game.metadata["a long one"].len(), value_len);
+    }
+
+    #[test]
+    fn a_listing_lives_an_hour_at_most() {
+        let content = serde_json::json!({
+            "protocol": PROTOCOL, "name": "Forever", "version": "1.0",
+            "players": 1, "max_players": 2,
+        });
+        let game = open(parse_listing(&config(), &event(&content, 100 * 365 * 24 * 3600)));
+        let left = game.expires.duration_since(SystemTime::now()).unwrap();
+        assert!(left <= MAX_TTL, "{left:?}");
     }
 
     #[test]
     fn malformed_listings_are_ignored() {
         let config = config();
         assert!(parse_listing(&config, &event(&serde_json::json!({ "name": "x" }), 60)).is_none());
+        let huge = serde_json::json!({
+            "protocol": PROTOCOL, "name": "Huge", "version": "1.0", "players": 1,
+            "max_players": 2, "padding": "x".repeat(MAX_CONTENT),
+        });
+        assert!(parse_listing(&config, &event(&huge, 60)).is_none());
         let other_protocol = serde_json::json!({
             "protocol": PROTOCOL + 1, "name": "Future", "version": "1.0",
             "players": 1, "max_players": 2,
