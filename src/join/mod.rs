@@ -82,8 +82,9 @@ pub struct Join {
     stage: Stage,
     started: Instant,
     subscription: SubscriptionId,
-    /// Dropping it ends the relay task.
-    to_relay: Sink<SendRequest>,
+    /// Dropping it ends the relay task, which repeats the request until the host answers.
+    /// `None` once the join has finished.
+    to_relay: Option<Sink<SendRequest>>,
     from_relay: Inbox<FromRelay>,
     link: Option<Link>,
     symmetric_nat: bool,
@@ -146,7 +147,7 @@ impl Join {
             stage: Stage::Gathering(None),
             started: now,
             subscription,
-            to_relay,
+            to_relay: Some(to_relay),
             from_relay,
             link: None,
             symmetric_nat: false,
@@ -170,6 +171,8 @@ impl Join {
         let result = self.step(Instant::now());
         if result.is_some() {
             self.stage = Stage::Finished;
+            // Stops the relay task repeating the request.
+            self.to_relay = None;
             self.inner
                 .signal
                 .send(Command::Unsubscribe(self.subscription.clone()));
@@ -272,7 +275,9 @@ impl Join {
             ice: link.params(),
         };
         // Sealed, sent and repeated by the relay task.
-        let _ = self.to_relay.send(SendRequest(request));
+        if let Some(to_relay) = &self.to_relay {
+            let _ = to_relay.send(SendRequest(request));
+        }
         self.link = Some(link);
         self.stage = Stage::WaitingForHost {
             since: now,

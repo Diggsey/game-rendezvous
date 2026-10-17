@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{HostGame, TestNet, listing, wait_for};
+use common::{HANDSHAKE_KIND, HostGame, TestNet, forged_request, listing, wait_for};
 use game_rendezvous::{Connection, GameInfo, HostEvent, JoinError, RefuseReason, Rendezvous};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -213,6 +213,12 @@ fn silent_host_is_reported() {
         matches!(result, Err(JoinError::HostNotResponding)),
         "{result:?}"
     );
+    // A finished join stops asking, though the game still holds it (to show the error).
+    let client = net.client();
+    let host_key = net.host_key(&client);
+    let repeats = net.count_handshakes(&client, host_key, Duration::from_secs(5));
+    assert_eq!(repeats, 0, "the finished join kept sending its request");
+    assert!(join.poll().is_none());
 }
 
 #[test]
@@ -310,52 +316,23 @@ fn a_flood_of_junk_requests_does_not_reach_the_game() {
     let game = find_game(&mut browser, &mut host, "Flooded");
 
     // The host's key, from its listing on the relay.
-    let client = Client::default();
-    let host_key = net.runtime.block_on(async {
-        client.add_relay(net.relay_url.as_str()).await.unwrap();
-        client.connect().await;
-        let filter = Filter::new()
-            .kind(Kind::Custom(30078))
-            .identifier("game-rendezvous/game-rendezvous-test");
-        let events = client
-            .fetch_events(filter)
-            .timeout(Duration::from_secs(5))
-            .await
-            .unwrap();
-        events.iter().next().expect("the listing").pubkey
-    });
+    let client = net.client();
+    let host_key = net.host_key(&client);
 
     // 300 unreadable messages, and 50 readable requests for another game.
     let mut flood = Vec::new();
-    for i in 0..350 {
+    for i in 0..300 {
         let keys = Keys::generate();
-        let content = if i < 300 {
-            format!("not a NIP-44 payload {i}")
-        } else {
-            let request = serde_json::json!({
-                "type": "request", "attempt": format!("{i}"), "game_id": "another-game",
-                "version": "1.0", "protocol": 1, "player_name": format!("Spam {i}"),
-                "ice": { "ufrag": "x", "pwd": "y", "candidates": [] },
-            });
-            nip44::encrypt(
-                keys.secret_key(),
-                &host_key,
-                request.to_string(),
-                nip44::Version::V2,
-            )
-            .unwrap()
-        };
-        let event = EventBuilder::new(Kind::Custom(21_059), content)
+        let event = EventBuilder::new(HANDSHAKE_KIND, format!("not a NIP-44 payload {i}"))
             .tag(Tag::public_key(host_key))
             .finalize(&keys)
             .unwrap();
         flood.push(event);
     }
-    net.runtime.block_on(async {
-        for event in &flood {
-            client.send_event(event).await.unwrap();
-        }
-    });
+    for i in 0..50 {
+        flood.push(forged_request(&host_key, "another-game", "1.0", &format!("Spam {i}")));
+    }
+    net.send(&client, &flood);
 
     // A real player joins straight after the flood.
     let mut join = client_rv.join(&game, "Bob").unwrap();
@@ -378,3 +355,4 @@ fn a_flood_of_junk_requests_does_not_reach_the_game() {
         host.events
     );
 }
+

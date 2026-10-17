@@ -7,7 +7,13 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use game_rendezvous::{Config, Host, HostEvent, Listing, Rendezvous, bind_dual_stack};
-use nostr_sdk::prelude::{LocalRelay, RateLimit};
+use nostr_sdk::prelude::{
+    Client, Event, EventBuilder, FinalizeEvent, Filter, Keys, Kind, LocalRelay, PublicKey,
+    RateLimit, Tag, nip44,
+};
+
+/// The handshake's event kind.
+pub const HANDSHAKE_KIND: Kind = Kind::Custom(21_059);
 
 pub struct TestNet {
     pub relay_url: String,
@@ -58,6 +64,83 @@ impl TestNet {
         c.connect_timeout = Duration::from_secs(4);
         c
     }
+
+    /// A Nostr client of the test's own on the relay, for sending and watching events.
+    pub fn client(&self) -> Client {
+        let client = Client::default();
+        self.runtime.block_on(async {
+            client.add_relay(self.relay_url.as_str()).await.unwrap();
+            client.connect().await;
+        });
+        client
+    }
+
+    /// The key a host signs its listing with (the only listing on the relay).
+    pub fn host_key(&self, client: &Client) -> PublicKey {
+        self.runtime.block_on(async {
+            let filter = Filter::new()
+                .kind(Kind::Custom(30078))
+                .identifier("game-rendezvous/game-rendezvous-test");
+            let events = client
+                .fetch_events(filter)
+                .timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+            events.iter().next().expect("the listing").pubkey
+        })
+    }
+
+    /// Sends `events` through `client`.
+    pub fn send(&self, client: &Client, events: &[Event]) {
+        self.runtime.block_on(async {
+            for event in events {
+                client.send_event(event).await.unwrap();
+            }
+        });
+    }
+
+    /// How many handshake events reach `to` over `period`.
+    pub fn count_handshakes(&self, client: &Client, to: PublicKey, period: Duration) -> usize {
+        use nostr_sdk::prelude::{ClientNotification, RelayMessage, StreamExt};
+        self.runtime.block_on(async {
+            let mut notifications = client.notifications();
+            let filter = Filter::new().kind(HANDSHAKE_KIND).pubkey(to);
+            let id = client.subscribe(filter).await.unwrap().value;
+            let mut seen = std::collections::HashSet::new();
+            let deadline = tokio::time::Instant::now() + period;
+            while let Ok(Some(n)) = tokio::time::timeout_at(deadline, notifications.next()).await {
+                if let ClientNotification::Message { message, .. } = n
+                    && let RelayMessage::Event { subscription_id, event } = *message
+                    && *subscription_id == id
+                {
+                    seen.insert(event.id);
+                }
+            }
+            let _ = client.unsubscribe(&id).await;
+            seen.len()
+        })
+    }
+}
+
+/// A join request to the host at `to`, signed by a key of its own, as a stranger could send.
+pub fn forged_request(to: &PublicKey, game_id: &str, version: &str, name: &str) -> Event {
+    let keys = Keys::generate();
+    let request = serde_json::json!({
+        "type": "request", "attempt": name, "game_id": game_id,
+        "version": version, "protocol": 1, "player_name": name,
+        "ice": { "ufrag": "abcd", "pwd": "abcdefghijklmnopqrstuv", "candidates": [] },
+    });
+    let content = nip44::encrypt(
+        keys.secret_key(),
+        to,
+        request.to_string(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    EventBuilder::new(HANDSHAKE_KIND, content)
+        .tag(Tag::public_key(*to))
+        .finalize(&keys)
+        .unwrap()
 }
 
 /// Logs to the test's output (shown for failures, or with `--nocapture`).
