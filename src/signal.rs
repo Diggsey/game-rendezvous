@@ -291,12 +291,10 @@ async fn count_connected(client: &Client) -> usize {
 }
 
 async fn publish(client: &Client, shared: &Shared, event: &Event) -> Published {
-    // Right after start no relay is connected yet; give them a moment.
+    // Right after start no relay is connected yet; give them a moment. The worker's status
+    // tick keeps the count current.
     let start = tokio::time::Instant::now();
-    while shared.relays_connected.load(Ordering::Relaxed) == 0
-        && count_connected(client).await == 0
-        && start.elapsed() < CONNECT_WAIT
-    {
+    while shared.relays_connected.load(Ordering::Relaxed) == 0 && start.elapsed() < CONNECT_WAIT {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // A relay that never acknowledges must not hold up the report of the others.
