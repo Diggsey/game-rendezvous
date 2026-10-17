@@ -2,7 +2,7 @@
 //!
 //! It publishes and refreshes the listing (and its tombstone at the end), reads join requests,
 //! refuses the ones the host would refuse, answers repeats, and passes the game thread only the
-//! requests it accepted, decrypted. Decrypting is capped per second ([`DecryptBudget`]), so a
+//! requests it accepted, decrypted. Decrypting is capped per second ([`RateBudget`]), so a
 //! flood of requests costs bounded work here and none on the game thread.
 
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use nostr_sdk::prelude::{Event, Keys, PublicKey, Timestamp};
 use tracing::{debug, info, warn};
 
 use crate::Config;
-use crate::handshake::{self, DecryptBudget, IceParams, Message, RefuseReason};
+use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
 use crate::listing::{Listing, PROTOCOL, listing_event};
 use crate::signal::{Inbox, Published, Sink, TaskContext};
 
@@ -22,6 +22,11 @@ pub(super) const MAX_JOINERS: usize = 16;
 const PUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// The quickest an accept is sent again to a joiner repeating its request.
 const RESEND_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Refusals published per second at most. Anyone who reads the listing can send requests the
+/// host refuses, and each refusal is an event for every relay: unlimited, they would get the
+/// host rate-limited by the relays, its listing with it. A refused joiner repeats its request,
+/// so one turned away unanswered is answered later.
+const REFUSALS_PER_SECOND: u32 = 4;
 
 /// From the game thread.
 pub(super) enum ToRelay {
@@ -80,7 +85,8 @@ impl Relay {
             last_publish: None,
             last_created: None,
             active: HashMap::new(),
-            budget: DecryptBudget::new(self.config.handshake_rate),
+            budget: RateBudget::new(self.config.handshake_rate, "handshake messages unread"),
+            refusals: RateBudget::new(REFUSALS_PER_SECOND, "refusals unsent"),
         };
         loop {
             let due = state.listing_due(&self.config);
@@ -198,6 +204,9 @@ impl Relay {
             None
         };
         if let Some(reason) = refusal {
+            if !state.refusals.take() {
+                return;
+            }
             info!("refusing {player_name} (version {version}): {reason:?}");
             let refuse = Message::Refuse {
                 attempt,
@@ -234,7 +243,8 @@ struct State {
     /// The date of the last listing published: each copy must be dated after the last.
     last_created: Option<Timestamp>,
     active: HashMap<PublicKey, Active>,
-    budget: DecryptBudget,
+    budget: RateBudget,
+    refusals: RateBudget,
 }
 
 impl State {

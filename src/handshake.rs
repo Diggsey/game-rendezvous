@@ -80,34 +80,38 @@ pub(crate) fn open(keys: &Keys, event: &Event) -> Option<Message> {
     serde_json::from_str(&json).ok()
 }
 
-/// Caps the handshake messages decrypted per second: the cost of decrypting is the one a
-/// stranger can impose by sending events.
-pub(crate) struct DecryptBudget {
+/// Caps how often per second something a stranger can cause happens: decrypting a handshake
+/// message, or publishing a refusal.
+pub(crate) struct RateBudget {
     per_second: u32,
+    /// What is dropped over budget, for the log, e.g. "handshake messages unread".
+    what: &'static str,
     window: Instant,
     used: u32,
-    /// Messages dropped unread in the current window, reported once it ends.
+    /// Times dropped in the current window, reported once it ends.
     dropped: u32,
 }
 
-impl DecryptBudget {
-    pub fn new(per_second: u32) -> Self {
-        DecryptBudget {
+impl RateBudget {
+    pub fn new(per_second: u32, what: &'static str) -> Self {
+        RateBudget {
             per_second,
+            what,
             window: Instant::now(),
             used: 0,
             dropped: 0,
         }
     }
 
-    /// Whether one more message may be decrypted now.
+    /// Whether it may happen once more now.
     pub fn take(&mut self) -> bool {
         let now = Instant::now();
         if now - self.window >= Duration::from_secs(1) {
             if self.dropped > 0 {
                 tracing::warn!(
-                    "dropped {} handshake messages unread (over {} a second)",
+                    "dropped {} {} (over {} a second)",
                     self.dropped,
+                    self.what,
                     self.per_second
                 );
             }

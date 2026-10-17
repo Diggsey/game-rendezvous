@@ -99,12 +99,11 @@ impl TestNet {
         });
     }
 
-    /// How many handshake events reach `to` over `period`.
-    pub fn count_handshakes(&self, client: &Client, to: PublicKey, period: Duration) -> usize {
+    /// How many events matching `filter` the relay passes on over `period`.
+    pub fn count_events(&self, client: &Client, filter: Filter, period: Duration) -> usize {
         use nostr_sdk::prelude::{ClientNotification, RelayMessage, StreamExt};
         self.runtime.block_on(async {
             let mut notifications = client.notifications();
-            let filter = Filter::new().kind(HANDSHAKE_KIND).pubkey(to);
             let id = client.subscribe(filter).await.unwrap().value;
             let mut seen = std::collections::HashSet::new();
             let deadline = tokio::time::Instant::now() + period;

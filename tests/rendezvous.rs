@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use common::{HANDSHAKE_KIND, HostGame, TestNet, forged_request, listing, wait_for};
 use game_rendezvous::{Connection, GameInfo, HostEvent, JoinError, RefuseReason, Rendezvous};
+use nostr_sdk::prelude::Filter;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -217,7 +218,8 @@ fn silent_host_is_reported() {
     // A finished join stops asking, though the game still holds it (to show the error).
     let client = net.client();
     let host_key = net.host_key(&client);
-    let repeats = net.count_handshakes(&client, host_key, Duration::from_secs(5));
+    let to_host = Filter::new().kind(HANDSHAKE_KIND).pubkey(host_key);
+    let repeats = net.count_events(&client, to_host, Duration::from_secs(5));
     assert_eq!(repeats, 0, "the finished join kept sending its request");
     assert!(join.poll().is_none());
 }
@@ -403,4 +405,43 @@ fn greet(host: &mut HostGame, greeted: &mut bool) {
         game_rendezvous::send_to(&host.socket, b"welcome", addr).unwrap();
         *greeted = true;
     }
+}
+
+/// Anyone who reads the listing can send requests the host refuses. A flood of them is
+/// refused at a few a second: the host does not flood the relays (and get itself
+/// rate-limited) with refusals, nor the game with JoinRefused events.
+#[test]
+fn a_flood_of_refusable_requests_gets_few_refusals() {
+    let net = TestNet::start();
+    let host_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut host = HostGame::new(&host_rv, listing("Refusing"));
+    let mut browser = client_rv.browse();
+    find_game(&mut browser, &mut host, "Refusing");
+    let client = net.client();
+    let host_key = net.host_key(&client);
+
+    let flood: Vec<_> = (0..100)
+        .map(|i| forged_request(&host_key, "game-rendezvous-test", "0.1", &format!("Old {i}")))
+        .collect();
+    let from_host = Filter::new().kind(HANDSHAKE_KIND).author(host_key);
+    let watcher = net.client();
+    let counting = std::thread::scope(|s| {
+        let counting = s.spawn(|| net.count_events(&watcher, from_host, Duration::from_secs(3)));
+        std::thread::sleep(Duration::from_millis(300));
+        net.send(&client, &flood);
+        for _ in 0..300 {
+            host.frame();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        counting.join().unwrap()
+    });
+    assert!(counting >= 1, "no refusal at all");
+    assert!(counting <= 16, "{counting} refusals in 3 s");
+    let refused = host
+        .events
+        .iter()
+        .filter(|e| matches!(e, HostEvent::JoinRefused { .. }))
+        .count();
+    assert!((1..=16).contains(&refused), "{refused} JoinRefused events");
 }

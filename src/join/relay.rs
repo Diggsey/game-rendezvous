@@ -7,7 +7,7 @@ use std::time::Duration;
 use nostr_sdk::prelude::{Event, Keys, PublicKey};
 use tracing::debug;
 
-use crate::handshake::{self, DecryptBudget, IceParams, Message, RefuseReason};
+use crate::handshake::{self, IceParams, Message, RateBudget, RefuseReason};
 use crate::signal::{Inbox, Published, Sink, TaskContext};
 
 /// How often the join request is repeated until the host answers: relays may lose an
@@ -55,7 +55,7 @@ impl Relay {
             .publish_in_background(event, Some(published_tx.clone()));
         // Until a relay takes a copy, the game hears how each one went.
         let mut taken = false;
-        let mut budget = DecryptBudget::new(self.handshake_rate);
+        let mut budget = RateBudget::new(self.handshake_rate, "handshake messages unread");
         let mut repeat = tokio::time::interval(REQUEST_INTERVAL);
         repeat.tick().await; // the first tick is immediate: the request has just gone out
         loop {
@@ -86,7 +86,7 @@ impl Relay {
     }
 
     /// The host's answer to this attempt in `reply`, if that is what it is.
-    fn open(&self, budget: &mut DecryptBudget, reply: &Event) -> Option<FromRelay> {
+    fn open(&self, budget: &mut RateBudget, reply: &Event) -> Option<FromRelay> {
         if reply.pubkey != self.host || !budget.take() {
             return None;
         }
