@@ -214,7 +214,7 @@ async fn run(
     tasks.spawn(resolve_stun(stun_servers, shared.clone()));
     let mut sinks: HashMap<SubscriptionId, Sink<Event>> = HashMap::new();
     // Each relay sends its own copy of an event; subscribers get one.
-    let mut seen: HashSet<(SubscriptionId, EventId)> = HashSet::new();
+    let mut seen = Seen::default();
     let mut status_tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
@@ -255,9 +255,6 @@ async fn run(
                 if !seen.insert((subscription_id.as_ref().clone(), event.id)) {
                     continue;
                 }
-                if seen.len() > 10_000 {
-                    seen.clear();
-                }
                 if let Some(sink) = sinks.get(subscription_id.as_ref())
                     && sink.send(event.into_owned()).is_err()
                 {
@@ -279,6 +276,34 @@ async fn run(
     })
     .await;
     client.shutdown().await;
+}
+
+/// The events delivered lately, by subscription, so that other relays' copies are dropped.
+///
+/// Two generations of [`SEEN_GENERATION`] each: when the newer fills up, the older is
+/// forgotten. Memory stays bounded, and an event is forgotten only once that many others
+/// have arrived since, never at once with every recent one (which a relay could otherwise
+/// force by sending junk).
+#[derive(Default)]
+struct Seen {
+    current: HashSet<(SubscriptionId, EventId)>,
+    previous: HashSet<(SubscriptionId, EventId)>,
+}
+
+/// How many events a generation of [`Seen`] holds.
+const SEEN_GENERATION: usize = 5_000;
+
+impl Seen {
+    /// Whether `key` is new; it is remembered either way.
+    fn insert(&mut self, key: (SubscriptionId, EventId)) -> bool {
+        if self.previous.contains(&key) || !self.current.insert(key) {
+            return false;
+        }
+        if self.current.len() >= SEEN_GENERATION {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        true
+    }
 }
 
 async fn count_connected(client: &Client) -> usize {
@@ -352,4 +377,34 @@ async fn resolve_stun(servers: Vec<String>, shared: Arc<Shared>) {
         found.extend(v4.into_iter().chain(v6).copied());
     }
     *shared.stun_servers.lock().unwrap() = Some(found);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(sub: &SubscriptionId, n: usize) -> (SubscriptionId, EventId) {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        (sub.clone(), EventId::from_byte_array(bytes))
+    }
+
+    #[test]
+    fn recent_events_stay_seen_through_a_flood() {
+        let sub = SubscriptionId::new("s");
+        let mut seen = Seen::default();
+        assert!(seen.insert(key(&sub, 0)));
+        assert!(!seen.insert(key(&sub, 0)));
+        // A flood fills a generation: the event just before it is still known.
+        for n in 1..SEEN_GENERATION {
+            assert!(seen.insert(key(&sub, n)));
+        }
+        assert!(!seen.insert(key(&sub, SEEN_GENERATION - 1)));
+        assert!(!seen.insert(key(&sub, 0)));
+        // Only after another full generation is it forgotten.
+        for n in SEEN_GENERATION..2 * SEEN_GENERATION {
+            seen.insert(key(&sub, n));
+        }
+        assert!(seen.insert(key(&sub, 0)));
+    }
 }
