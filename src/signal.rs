@@ -18,11 +18,12 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::StreamExt;
 use nostr_sdk::prelude::{Client, ClientNotification, RelayStatus};
-use nostr_sdk::prelude::{Event, EventId, Filter, RelayMessage, SubscriptionId};
+use nostr_sdk::prelude::{Event, EventId, Filter, Keys, PublicKey, RelayMessage, SubscriptionId};
 use tokio::sync::{mpsc as tmpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
+use crate::handshake::{self, Message};
 use crate::portmap::{self, PortMapEvent};
 
 /// How long shutting down waits for last messages (closing listings, removing port mappings).
@@ -86,6 +87,25 @@ impl TaskContext {
     /// Publishes `event`, waiting for the relays' answers.
     pub async fn publish(&self, event: &Event) -> Published {
         publish(&self.client, &self.shared, event).await
+    }
+
+    /// Seals `message` from `keys` to `to` and publishes it in the background; the outcome goes
+    /// to `done`, if given. Returns whether it could be sealed.
+    ///
+    /// Each call seals afresh, so a repeat is a new event: relays (and subscribers) drop one
+    /// they have already seen.
+    pub fn send_sealed(
+        &self,
+        keys: &Keys,
+        to: &PublicKey,
+        message: &Message,
+        done: Option<Sink<Published>>,
+    ) -> bool {
+        let Some(event) = handshake::seal(keys, to, message) else {
+            return false;
+        };
+        self.publish_in_background(event, done);
+        true
     }
 
     /// Publishes `event` in the background; its outcome goes to `done`, if given.

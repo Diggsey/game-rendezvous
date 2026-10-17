@@ -128,9 +128,7 @@ impl Relay {
                     return;
                 };
                 let accept = Message::Accept { attempt, ice };
-                if let Some(event) = handshake::seal(&self.keys, &to, &accept) {
-                    self.ctx.publish_in_background(event, None);
-                }
+                self.ctx.send_sealed(&self.keys, &to, &accept, None);
                 active.accept = Some(accept);
                 active.last_sent = Some(Instant::now());
             }
@@ -167,15 +165,13 @@ impl Relay {
         // A joiner repeating its request (each attempt has its own key): answer again, unread.
         if let Some(active) = state.active.get_mut(&from) {
             let now = Instant::now();
-            // Sealed afresh: relays (and subscribers) drop an event they have already seen.
             if let Some(accept) = &active.accept
                 && active
                     .last_sent
                     .is_none_or(|t| now - t >= RESEND_MIN_INTERVAL)
-                && let Some(event) = handshake::seal(&self.keys, &from, accept)
+                && self.ctx.send_sealed(&self.keys, &from, accept, None)
             {
                 active.last_sent = Some(now);
-                self.ctx.publish_in_background(event, None);
             }
             return;
         }
@@ -229,9 +225,7 @@ impl Relay {
                 attempt,
                 reason: reason.clone(),
             };
-            if let Some(e) = handshake::seal(&self.keys, &from, &refuse) {
-                self.ctx.publish_in_background(e, None);
-            }
+            self.ctx.send_sealed(&self.keys, &from, &refuse, None);
             let _ = self.notices.send(FromRelay::Refused {
                 name: player_name,
                 reason,

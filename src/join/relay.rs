@@ -43,16 +43,17 @@ impl Relay {
         let Some(SendRequest(request)) = self.commands.recv().await else {
             return;
         };
-        let Some(event) = handshake::seal(&self.keys, &self.host, &request) else {
+        let (published_tx, mut published) = crate::signal::channel();
+        let sent = self
+            .ctx
+            .send_sealed(&self.keys, &self.host, &request, Some(published_tx.clone()));
+        if !sent {
             let _ = self.notices.send(FromRelay::Published(Published {
                 accepted: 0,
                 errors: vec!["could not sign the request".into()],
             }));
             return;
-        };
-        let (published_tx, mut published) = crate::signal::channel();
-        self.ctx
-            .publish_in_background(event, Some(published_tx.clone()));
+        }
         // Until a relay takes a copy, the game hears how each one went.
         let mut taken = false;
         let mut budget = RateBudget::new(self.handshake_rate, "handshake messages unread");
@@ -68,12 +69,9 @@ impl Relay {
                         let _ = self.notices.send(FromRelay::Published(p));
                     }
                 }
-                // Sealed afresh: relays (and subscribers) drop an event they have already seen.
                 _ = repeat.tick() => {
-                    if let Some(event) = handshake::seal(&self.keys, &self.host, &request) {
-                        let done = (!taken).then(|| published_tx.clone());
-                        self.ctx.publish_in_background(event, done);
-                    }
+                    let done = (!taken).then(|| published_tx.clone());
+                    self.ctx.send_sealed(&self.keys, &self.host, &request, done);
                 }
                 Some(reply) = self.replies.recv() => {
                     if let Some(answer) = self.open(&mut budget, &reply) {

@@ -211,18 +211,11 @@ impl Join {
                 if gatherer.is_none()
                     && let Some(servers) = self.inner.signal.stun_servers()
                 {
-                    let families = net::Families::of(socket);
-                    let servers = servers
-                        .into_iter()
-                        .filter(|s| families.reaches(s.ip()))
-                        .collect();
                     let left = deadline.saturating_duration_since(now);
-                    *gatherer = Some(Gatherer::new(servers, now, left));
+                    *gatherer = Some(Gatherer::for_socket(socket, servers, now, left));
                 }
                 if let Some(g) = gatherer {
-                    for (server, request) in g.poll_transmit(now) {
-                        let _ = net::send_to(socket, &request, server);
-                    }
+                    g.send_due(now, socket);
                 }
                 let done = gatherer.as_ref().is_some_and(|g| g.is_done(now));
                 if done || now >= deadline {

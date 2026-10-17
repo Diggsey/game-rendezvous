@@ -187,6 +187,29 @@ impl Gatherer {
         }
     }
 
+    /// Gathers for `socket` from those of `servers` (already resolved) it can reach, for at
+    /// most `timeout`.
+    pub fn for_socket(
+        socket: &UdpSocket,
+        servers: Vec<SocketAddr>,
+        now: Instant,
+        timeout: Duration,
+    ) -> Self {
+        let families = crate::net::Families::of(socket);
+        let servers = servers
+            .into_iter()
+            .filter(|s| families.reaches(s.ip()))
+            .collect();
+        Gatherer::new(servers, now, timeout)
+    }
+
+    /// Sends the requests due by `now` from `socket`.
+    pub fn send_due(&mut self, now: Instant, socket: &UdpSocket) {
+        for (server, request) in self.poll_transmit(now) {
+            let _ = crate::net::send_to(socket, &request, server);
+        }
+    }
+
     /// The requests due by `now`, as (server, datagram).
     pub fn poll_transmit(&mut self, now: Instant) -> Vec<(SocketAddr, [u8; 20])> {
         let mut out = Vec::new();

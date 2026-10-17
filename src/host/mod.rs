@@ -252,21 +252,11 @@ impl Host {
             let Some(servers) = self.inner.signal.stun_servers() else {
                 return; // still resolving
             };
-            let families = net::Families::of(&self.socket);
-            let servers = servers
-                .into_iter()
-                .filter(|s| families.reaches(s.ip()))
-                .collect();
-            self.gatherer = Some(Gatherer::new(
-                servers,
-                now,
-                self.inner.config.gather_timeout,
-            ));
+            let timeout = self.inner.config.gather_timeout;
+            self.gatherer = Some(Gatherer::for_socket(&self.socket, servers, now, timeout));
         }
         let Some(g) = &mut self.gatherer else { return };
-        for (server, request) in g.poll_transmit(now) {
-            let _ = net::send_to(&self.socket, &request, server);
-        }
+        g.send_due(now, &self.socket);
         if g.is_done(now) {
             let mapped = g.mapped();
             if !mapped.is_empty() || self.last_gather.is_none() {
