@@ -27,6 +27,9 @@ use crate::portmap::{self, PortMapEvent};
 
 /// How long shutting down waits for last messages (closing listings, removing port mappings).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long shutting down waits for port mappings in progress: long enough to finish a
+/// gateway search and mapping, then remove it, so that none is left open on the router.
+const PORT_MAP_GRACE: Duration = Duration::from_secs(8);
 /// How long to wait before looking the STUN servers up again when none resolved.
 const STUN_RETRY: Duration = Duration::from_secs(15);
 /// How long a publish waits for a first relay connection.
@@ -127,7 +130,7 @@ impl Drop for Worker {
         // tombstone and the port mapping removal out.
         let finished = self.finished.get_mut().unwrap();
         if finished
-            .recv_timeout(SHUTDOWN_GRACE + Duration::from_secs(1))
+            .recv_timeout(PORT_MAP_GRACE + Duration::from_secs(1))
             .is_ok()
             && let Some(t) = self.thread.get_mut().unwrap().take()
         {
@@ -216,6 +219,8 @@ async fn run(
     client.connect().await;
     let mut notifications = client.notifications();
     let mut tasks = JoinSet::new();
+    // Port mappings: shutting down waits longer for them (`PORT_MAP_GRACE`).
+    let mut port_maps = JoinSet::new();
     // It may wait to try again, so shutting down stops it rather than waiting for it.
     let resolving = tasks.spawn(resolve_stun(stun_servers, shared.clone()));
     let mut sinks: HashMap<SubscriptionId, Sink<Event>> = HashMap::new();
@@ -254,7 +259,7 @@ async fn run(
                     });
                 }
                 Some(Command::MapPort { port, events, stop }) => {
-                    tasks.spawn(portmap::run(port, events, stop));
+                    port_maps.spawn(portmap::run(port, events, stop));
                 }
                 Some(Command::Spawn(task)) => {
                     tasks.spawn(task(TaskContext {
@@ -285,14 +290,21 @@ async fn run(
             }
             // Reap finished tasks so the set does not grow.
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            Some(_) = port_maps.join_next(), if !port_maps.is_empty() => {}
         }
     }
     resolving.abort();
-    // Let queued publishes and port mapping removals finish, but not forever.
-    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await;
+    // Let the tasks finish (a closing host publishes its tombstone), and the port mappings be
+    // removed, but not forever. Publishes in the background, such as answers to joiners, are
+    // not waited for.
+    let _ = tokio::join!(
+        tokio::time::timeout(SHUTDOWN_GRACE, async {
+            while tasks.join_next().await.is_some() {}
+        }),
+        tokio::time::timeout(PORT_MAP_GRACE, async {
+            while port_maps.join_next().await.is_some() {}
+        }),
+    );
     client.shutdown().await;
 }
 
