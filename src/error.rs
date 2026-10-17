@@ -59,7 +59,8 @@ impl fmt::Display for JoinError {
             } => {
                 write!(
                     f,
-                    "no network path to the host worked ({tried} tried); the host can turn on                      UPnP or forward their UDP port"
+                    "no network path to the host worked ({tried} tried); the host can turn on \
+                     UPnP or forward their UDP port"
                 )?;
                 if *symmetric_nat {
                     write!(f, " (your router's symmetric NAT blocks hole punching)")?;
@@ -76,5 +77,23 @@ impl std::error::Error for JoinError {}
 impl From<io::Error> for JoinError {
     fn from(e: io::Error) -> Self {
         JoinError::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_route_message_reads_as_one_line() {
+        let e = JoinError::NoRoute {
+            tried: 3,
+            symmetric_nat: true,
+        };
+        assert_eq!(
+            e.to_string(),
+            "no network path to the host worked (3 tried); the host can turn on UPnP or forward \
+             their UDP port (your router's symmetric NAT blocks hole punching)"
+        );
     }
 }
