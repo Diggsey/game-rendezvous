@@ -42,7 +42,8 @@ pub struct Config {
     pub relays: Vec<String>,
     /// STUN servers, as `host:port`.
     pub stun_servers: Vec<String>,
-    /// Whether a host asks its router to open its port (UPnP IGD, NAT-PMP, PCP).
+    /// Whether a host asks its router to open its port (UPnP IGD, NAT-PMP, PCP). Without the
+    /// `port-mapping` feature, a host only reports [`PortMapEvent::Failed`](crate::PortMapEvent).
     pub port_mapping: bool,
     /// The addresses to offer peers instead of this machine's own, e.g. `127.0.0.1` in tests.
     /// `None` uses every LAN and global IPv6 address of the machine.

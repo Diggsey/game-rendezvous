@@ -7,9 +7,9 @@ publish = false
 
 [dependencies]
 # NAT-PMP and PCP port mapping.
-crab_nat = "0.8"
+crab_nat = { version = "0.8", optional = true }
 # UPnP IGD port mapping.
-igd-next = { version = "0.18", features = ["aio_tokio"] }
+igd-next = { version = "0.18", features = ["aio_tokio"], optional = true }
 # str0m's sans-IO ICE agent: connectivity checks over a socket we own.
 is = "0.11"
 # The machine's interfaces, addresses and default gateway.
@@ -23,6 +23,12 @@ serde_json = "1"
 socket2 = "0.6"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 tracing = "0.1"
+
+[features]
+default = ["port-mapping"]
+# Ask a host's router to forward its port (UPnP IGD, NAT-PMP, PCP). Without it,
+# `Config::port_mapping` only reports that no port was mapped.
+port-mapping = ["dep:crab_nat", "dep:igd-next"]
 
 [dev-dependencies]
 nostr-sdk = { version = "0.45", features = ["local-relay"] }
