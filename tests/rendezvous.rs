@@ -148,6 +148,7 @@ fn join_connects_on_localhost() {
     );
 
     // Game traffic flows both ways on the connected sockets.
+    assert!(conn.received.is_empty(), "the host's game has sent nothing yet");
     game_rendezvous::send_to(&conn.socket, b"hello host", conn.peer).unwrap();
     let client_addr = wait_for(WAIT, "the client's datagram", || {
         host.frame();
@@ -356,3 +357,50 @@ fn a_flood_of_junk_requests_does_not_reach_the_game() {
     );
 }
 
+/// The host's game may greet a player the moment it connects, while the joiner's checks are
+/// still settling: the greeting reaches the joiner's game all the same.
+#[test]
+fn the_hosts_first_datagram_reaches_the_joiner() {
+    let net = TestNet::start();
+    let host_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut host = HostGame::new(&host_rv, listing("Greeter"));
+    let mut browser = client_rv.browse();
+    let game = find_game(&mut browser, &mut host, "Greeter");
+
+    let mut join = client_rv.join(&game, "Bob").unwrap();
+    let mut greeted = false;
+    let conn = wait_for(Duration::from_secs(30), "the join to finish", || {
+        host.frame();
+        greet(&mut host, &mut greeted);
+        join.poll()
+    })
+    .expect("a connection");
+    let mut got = conn.received.clone();
+    let mut buf = [0u8; 64];
+    wait_for(WAIT, "the greeting", || {
+        host.frame();
+        greet(&mut host, &mut greeted);
+        while let Ok((n, _)) = conn.socket.recv_from(&mut buf) {
+            if !game_rendezvous::stun::is_stun(&buf[..n]) {
+                got.push(buf[..n].to_vec());
+            }
+        }
+        got.iter().any(|d| d == b"welcome").then_some(())
+    });
+}
+
+/// Sends the joiner a greeting once the host has seen it connect.
+fn greet(host: &mut HostGame, greeted: &mut bool) {
+    if *greeted {
+        return;
+    }
+    let connected = host.events.iter().find_map(|e| match e {
+        HostEvent::PeerConnected { addr, .. } => Some(*addr),
+        _ => None,
+    });
+    if let Some(addr) = connected {
+        game_rendezvous::send_to(&host.socket, b"welcome", addr).unwrap();
+        *greeted = true;
+    }
+}

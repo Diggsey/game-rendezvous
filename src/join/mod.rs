@@ -27,6 +27,8 @@ use relay::{FromRelay, Relay, SendRequest};
 /// After nomination, how long the checks go on before the socket is handed over, so that the
 /// host's side of the nominated pair completes too.
 const SETTLE: Duration = Duration::from_millis(300);
+/// The most datagrams kept for the game from before the hand-over.
+const MAX_EARLY_DATAGRAMS: usize = 64;
 /// Room for the largest UDP payload, so that no datagram is too big to read.
 const RECV_BUFFER: usize = 65_536;
 
@@ -50,6 +52,9 @@ pub struct Connection {
     pub socket: UdpSocket,
     /// The host's address on the nominated path.
     pub peer: SocketAddr,
+    /// Datagrams `peer` sent before the hand-over (once connected, the host's game may start
+    /// talking while the checks settle), oldest first. Handle them before reading `socket`.
+    pub received: Vec<Vec<u8>>,
 }
 
 enum Stage {
@@ -92,6 +97,8 @@ pub struct Join {
     from_relay: Inbox<FromRelay>,
     link: Option<Link>,
     symmetric_nat: bool,
+    /// Datagrams that are not the library's, kept for the game: (sender, payload).
+    early: Vec<(SocketAddr, Vec<u8>)>,
     buf: Box<[u8]>,
 }
 
@@ -156,6 +163,7 @@ impl Join {
             from_relay,
             link: None,
             symmetric_nat: false,
+            early: Vec::new(),
             buf: vec![0; RECV_BUFFER].into_boxed_slice(),
         })
     }
@@ -254,9 +262,19 @@ impl Join {
             }
             Stage::Settling { since, peer } => {
                 if now - *since >= SETTLE {
-                    let peer = *peer;
+                    // The agent may have nominated a better pair while settling.
+                    let peer = self.link.as_ref().and_then(Link::nominated).unwrap_or(*peer);
                     let socket = self.socket.take()?;
-                    return Some(Ok(Connection { socket, peer }));
+                    let received = std::mem::take(&mut self.early)
+                        .into_iter()
+                        .filter(|(from, _)| *from == peer)
+                        .map(|(_, data)| data)
+                        .collect();
+                    return Some(Ok(Connection {
+                        socket,
+                        peer,
+                        received,
+                    }));
                 }
             }
             Stage::Finished => {}
@@ -358,6 +376,10 @@ impl Join {
             };
             let data = &self.buf[..n];
             if !stun::is_stun(data) {
+                // The host's game may start talking before the hand-over.
+                if self.link.is_some() && self.early.len() < MAX_EARLY_DATAGRAMS {
+                    self.early.push((net::canonical(from), data.to_vec()));
+                }
                 continue;
             }
             if let Stage::Gathering(Some(g)) = &mut self.stage
