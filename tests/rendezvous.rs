@@ -445,3 +445,49 @@ fn a_flood_of_refusable_requests_gets_few_refusals() {
         .count();
     assert!((1..=16).contains(&refused), "{refused} JoinRefused events");
 }
+
+/// A host connects a few joiners at a time and tells the rest it is busy. Requests from joiners
+/// that never send a check (anyone can send requests) give their places up soon, so they
+/// cannot keep real players out.
+#[test]
+fn silent_joiners_hold_their_places_only_briefly() {
+    let net = TestNet::start();
+    // Far longer than the silent joiners are kept.
+    let mut config = net.config("1.0");
+    config.connect_timeout = Duration::from_secs(30);
+    let host_rv = Rendezvous::new(config).unwrap();
+    let client_rv = Rendezvous::new(net.config("1.0")).unwrap();
+    let mut host = HostGame::new(&host_rv, listing("Crowded"));
+    let mut browser = client_rv.browse();
+    let game = find_game(&mut browser, &mut host, "Crowded");
+    let client = net.client();
+    let host_key = net.host_key(&client);
+
+    // Every place taken by requests whose senders never check.
+    let silent: Vec<_> = (0..16)
+        .map(|i| forged_request(&host_key, "game-rendezvous-test", "1.0", &format!("Ghost {i}")))
+        .collect();
+    net.send(&client, &silent);
+    for _ in 0..100 {
+        host.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut join = client_rv.join(&game, "Early").unwrap();
+    match finish_join(&mut join, &mut host) {
+        Err(JoinError::Refused(RefuseReason::Busy)) => {}
+        other => panic!("expected the host to be busy, got {other:?}"),
+    }
+
+    // Well before the connection timeout, the silent ones are let go.
+    wait_for(Duration::from_secs(10), "the silent joiners to be let go", || {
+        host.frame();
+        let failed = host
+            .events
+            .iter()
+            .filter(|e| matches!(e, HostEvent::PeerFailed { .. }))
+            .count();
+        (failed == 16).then_some(())
+    });
+    let mut join = client_rv.join(&game, "Bob").unwrap();
+    finish_join(&mut join, &mut host).expect("a place for a real player");
+}

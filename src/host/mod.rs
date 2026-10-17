@@ -32,6 +32,11 @@ const LINGER: Duration = Duration::from_secs(5);
 /// How often the public address is checked again with the STUN servers. This also keeps the
 /// NAT's mapping for the socket alive while nobody is connected.
 const REGATHER: Duration = Duration::from_secs(25);
+/// How long a joiner has, from the host's answer, to send its first check. One that sends none
+/// gives up its place among the joiners being connected (of which there are a few at most)
+/// sooner than the connection timeout: anyone can send requests, and else a request a second
+/// would keep every place taken and turn every real player away.
+const SILENT_JOINER: Duration = Duration::from_secs(6);
 
 /// What happened while hosting, from [`Host::poll`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +74,8 @@ struct Joiner {
     link: Link,
     started: Instant,
     connected_at: Option<Instant>,
+    /// A check (or answer) came from the joiner.
+    heard: bool,
 }
 
 /// An advertised game. The game keeps its own socket and passes every datagram that is not its
@@ -191,6 +198,7 @@ impl Host {
         if let Some(msg) = ice::parse(data)
             && let Some(j) = self.joiners.values_mut().find(|j| j.link.accepts(&msg))
         {
+            j.heard = true;
             j.link.handle(now, from, msg);
         }
         true
@@ -364,6 +372,7 @@ impl Host {
                 link,
                 started: now,
                 connected_at: None,
+                heard: false,
             },
         );
     }
@@ -383,9 +392,10 @@ impl Host {
                     name: j.name.clone(),
                 });
             }
+            let silent = !j.heard && now - j.started > SILENT_JOINER;
             match j.connected_at {
                 Some(t) if now - t > LINGER => done.push(*key),
-                None if now - j.started > timeout => {
+                None if silent || now - j.started > timeout => {
                     debug!("{} could not connect", j.name);
                     self.events.push_back(HostEvent::PeerFailed {
                         name: j.name.clone(),
